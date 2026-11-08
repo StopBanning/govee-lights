@@ -1,0 +1,12 @@
+{
+  "AA:BB:CC:DD:EE:FF:00:01": {
+    "ip": "192.168.1.20",
+    "name": "desk lamp",
+    "room": "office",
+    "sku": "H6008"
+  },
+  "AA:BB:CC:DD:EE:FF:00:02": {
+    "ip": "192.168.1.21",
+    "sku": "H60B2"
+  }
+}

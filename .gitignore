@@ -1,0 +1,18 @@
+# Built apps and generated shortcuts: rebuild with mac/build.sh and mac/make_shortcuts.py
+mac/*.app/
+mac/shortcuts/
+*.shortcut
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Your own data never belongs here. The code keeps it in ~/Library/Application Support/govee-lights
+# (or $GOVEE_LIGHTS_HOME), but just in case an older copy left it next to the code:
+lights.json
+scene-cache/
+govee-api-key
+.env
+
+.DS_Store

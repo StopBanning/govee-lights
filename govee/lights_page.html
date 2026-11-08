@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lights</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Lights">
+<meta name="theme-color" content="#f5f2ed" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1a21" media="(prefers-color-scheme: dark)">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<style>
+  :root {
+    --bg: #f5f2ed; --card: #ffffff; --ink: #1f1c23; --muted: #6d6874; --line: #e5e0d8;
+    --soft: #f0ece5; --accent: #d9822b; --warn: #b4532a; --off: #b9b4bd;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1a21; --card: #26232c; --ink: #f3f0f6; --muted: #a8a3b0; --line: #36323d;
+      --soft: #302c37; --accent: #f0a04b; --warn: #e8834f; --off: #5b5663;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  main {
+    max-width: 480px; margin: 0 auto;
+    padding: calc(12px + env(safe-area-inset-top)) 16px calc(88px + env(safe-area-inset-bottom));
+  }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0 4px; }
+  h1 { font-size: 30px; line-height: 1.1; margin: 0; letter-spacing: -0.01em; }
+  #summary { color: var(--muted); margin: 0 0 16px; font-size: 15px; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 14px; margin-bottom: 12px; }
+  .label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    min-height: 40px; padding: 8px 14px; border-radius: 999px; background: var(--soft);
+    border: 1px solid var(--line); font-size: 15px;
+  }
+  .chip[aria-pressed="true"] { background: var(--ink); color: var(--card); border-color: var(--ink); }
+  .chip .dot { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }
+  .scenes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .scene {
+    min-height: 64px; border-radius: 14px; font-weight: 600; font-size: 15px; background: var(--soft);
+    border: 1px solid var(--line); display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px;
+  }
+  .scene .dot { width: 18px; height: 18px; }
+  input[type="range"] { width: 100%; height: 36px; accent-color: var(--accent); margin: 0; }
+  .kelvin-scale {
+    display: flex; justify-content: space-between; align-items: center; height: 18px; margin: 2px 0 12px;
+    padding: 0 8px; border-radius: 9px; font-size: 11px; color: #4a3b2a;
+    background: linear-gradient(90deg, #ffb46b, #ffd9b0, #fff1e4, #e9f0ff);
+  }
+  .color-label { margin-top: 14px; }
+  .swatches { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+  .custom-color { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; font-size: 15px; }
+  .custom-color input {
+    width: 64px; height: 36px; padding: 2px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft);
+  }
+  .swatch { aspect-ratio: 1 / 1; border-radius: 50%; border: 2px solid var(--card); box-shadow: 0 0 0 1px var(--line); }
+  .light { display: flex; align-items: center; gap: 12px; min-height: 56px; border-top: 1px solid var(--line); }
+  .light:first-child { border-top: 0; }
+  .dot { width: 16px; height: 16px; border-radius: 50%; flex: none; box-shadow: 0 0 0 1px var(--line); }
+  .meta { flex: 1; min-width: 0; }
+  .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .blink { font-size: 14px; color: var(--muted); padding: 10px 6px; }
+  .switch {
+    width: 51px; height: 31px; border-radius: 999px; background: var(--off); position: relative; flex: none;
+    transition: background 0.2s;
+  }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 0.2s;
+  }
+  .switch[aria-checked="true"] { background: var(--accent); }
+  .switch[aria-checked="true"]::after { transform: translateX(20px); }
+  select, .key-row input {
+    min-height: 44px; border-radius: 12px; border: 1px solid var(--line); background: var(--soft); color: var(--ink);
+    font: inherit; padding: 0 12px;
+  }
+  select { width: 100%; margin-top: 12px; }
+  .note { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+  .key-row { display: flex; gap: 8px; margin-top: 12px; }
+  .key-row input { flex: 1; min-width: 0; }
+  .busy .card { opacity: 0.55; pointer-events: none; transition: opacity 0.15s; }
+  #toast {
+    position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+    max-width: 448px; margin: 0 auto; padding: 12px 14px; border-radius: 14px;
+    background: var(--ink); color: var(--card); font-size: 14px;
+    opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast.warn { background: var(--warn); color: #fff; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Lights</h1>
+    <button class="chip" id="refresh" aria-label="Look for lights again">Refresh</button>
+  </header>
+  <p id="summary">Asking the lights…</p>
+
+  <section class="card" aria-label="Which lights">
+    <div class="chips" id="targets"></div>
+  </section>
+
+  <section class="card" aria-label="Scenes">
+    <div class="scenes">
+      <button class="scene" data-scene="warm"><span class="dot" style="background:#ffb46b"></span>Warm</button>
+      <button class="scene" data-scene="bright"><span class="dot" style="background:#fff1e0"></span>Bright</button>
+      <button class="scene" data-scene="dim"><span class="dot" style="background:#9a6a3a"></span>Dim</button>
+      <button class="scene" data-scene="off"><span class="dot" style="background:var(--off)"></span>Off</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="label"><span>Brightness</span><span id="level"></span></p>
+    <input type="range" id="brightness" min="1" max="100" value="50" aria-label="Brightness">
+  </section>
+
+  <section class="card">
+    <p class="label"><span>White</span><span id="kelvin-level"></span></p>
+    <input type="range" id="kelvin" min="2700" max="6500" step="100" value="4000" aria-label="White temperature">
+    <div class="kelvin-scale" aria-hidden="true"><span>Warm</span><span>Cool</span></div>
+    <div class="chips" id="whites"></div>
+    <p class="label color-label"><span>Color</span></p>
+    <div class="swatches" id="colors"></div>
+    <div class="custom-color">
+      <label for="custom-color">Any color</label>
+      <input type="color" id="custom-color" value="#3366ff">
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="label"><span>Govee scenes</span></p>
+    <div class="chips" id="favorites"></div>
+    <select id="scene-pick" aria-label="More scenes"><option value="">More scenes…</option></select>
+    <p class="note" id="scene-note" hidden></p>
+  </section>
+
+  <section class="card">
+    <p class="label"><span>Each light</span></p>
+    <div id="list"></div>
+  </section>
+
+  <section class="card">
+    <p class="label"><span>Govee API key</span><span id="key-status"></span></p>
+    <p class="note">Bulb scenes go through Govee's cloud. In the Govee Home app: Profile, then the gear, then Apply for
+      API Key. Paste the key from Govee's email here. It's kept on your Mac and never shown again.</p>
+    <div class="key-row">
+      <input type="password" id="key" autocomplete="off" autocapitalize="off" spellcheck="false"
+             placeholder="Paste your key" aria-label="Govee API key">
+      <button class="chip" id="save-key">Save</button>
+    </div>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const WHITES = { warm: 2700, soft: 3000, neutral: 4000, cool: 5500, daylight: 6500 };
+const COLORS = {
+  red: "#ff0000", orange: "#ff6400", yellow: "#ffbe00", green: "#00ff00",
+  teal: "#00c88c", blue: "#0000ff", purple: "#8200ff", pink: "#ff328c",
+};
+
+const FAVORITES = ["Rainbow", "Aurora", "Fire", "Sunset Glow", "Party", "Movie"];
+
+const $ = (sel) => document.querySelector(sel);
+let target = "all";
+let lights = [];
+let scenes = { common: [], kinds: {}, need_key: [], key_saved: false };
+let busy = false;
+try { target = localStorage.getItem("target") || "all"; } catch (e) {}
+
+function kelvinColor(k) {
+  // Tanner Helland's approximation of the color of white light at k kelvin
+  const t = k / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.4708 * Math.log(t) - 161.1196;
+    b = t <= 19 ? 0 : 138.5177 * Math.log(t - 10) - 305.0448;
+  } else {
+    r = 329.6987 * Math.pow(t - 60, -0.1332);
+    g = 288.1222 * Math.pow(t - 60, -0.0755);
+    b = 255;
+  }
+  const c = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  return `rgb(${c(r)}, ${c(g)}, ${c(b)})`;
+}
+
+function shade(state) {
+  if (!state) return "transparent";
+  if (state.onOff !== 1) return "var(--off)";
+  if (state.colorTemInKelvin) return kelvinColor(state.colorTemInKelvin);
+  const c = state.color || {};
+  return `rgb(${c.r || 0}, ${c.g || 0}, ${c.b || 0})`;
+}
+
+function describe(state) {
+  if (!state) return "not answering";
+  if (state.onOff !== 1) return "off";
+  return `${state.brightness}% · ` + (state.colorTemInKelvin ? `white ${state.colorTemInKelvin}K` : "color");
+}
+
+const title = (word) => word.charAt(0).toUpperCase() + word.slice(1);
+
+function toast(text, warn) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.className = "show" + (warn ? " warn" : "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { el.className = warn ? "warn" : ""; }, warn ? 6000 : 3000);
+}
+
+function render(groups) {
+  if (!groups.includes(target)) target = "all";
+  $("#targets").replaceChildren(...groups.map((group) => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.textContent = group === "all" ? "All" : title(group);
+    b.setAttribute("aria-pressed", String(group === target));
+    b.onclick = () => {
+      target = group;
+      try { localStorage.setItem("target", group); } catch (e) {}
+      render(groups);
+    };
+    return b;
+  }));
+
+  const on = lights.filter((l) => l.state && l.state.onOff === 1);
+  const silent = lights.filter((l) => !l.state);
+  let summary = lights.length ? `${on.length} of ${lights.length} on` : "No lights found yet";
+  if (silent.length) summary += ` · ${silent.length} not answering`;
+  $("#summary").textContent = summary;
+
+  // Start the slider at the chosen lights' average brightness.
+  const chosen = target === "all" ? lights : lights.filter((l) => l.kind + "s" === target || l.room === target);
+  const levels = chosen.filter((l) => l.state && l.state.onOff === 1).map((l) => l.state.brightness);
+  if (levels.length && !$("#brightness").matches(":active")) {
+    const average = Math.round(levels.reduce((a, b) => a + b, 0) / levels.length);
+    $("#brightness").value = average;
+    $("#level").textContent = `${average}%`;
+  }
+  // Same for white temperature, from the chosen lights that are showing white (kelvin is 0 during a color).
+  const kelvins = chosen.filter((l) => l.state && l.state.onOff === 1 && l.state.colorTemInKelvin)
+    .map((l) => l.state.colorTemInKelvin);
+  if (!$("#kelvin").matches(":active")) {
+    if (kelvins.length) {
+      const average = Math.round(kelvins.reduce((a, b) => a + b, 0) / kelvins.length / 100) * 100;
+      $("#kelvin").value = Math.min(6500, Math.max(2700, average));
+      $("#kelvin-level").textContent = `${$("#kelvin").value}K`;
+    } else {
+      $("#kelvin-level").textContent = "";
+    }
+  }
+
+  $("#list").replaceChildren(...lights.map((l) => {
+    const row = document.createElement("div");
+    row.className = "light";
+    row.innerHTML = '<span class="dot"></span><div class="meta"><div class="name"></div><div class="sub"></div></div>'
+      + '<button class="blink">Blink</button><button class="switch" role="switch"></button>';
+    const isOn = !!(l.state && l.state.onOff === 1);
+    row.querySelector(".dot").style.background = shade(l.state);
+    row.querySelector(".name").textContent = l.label;
+    row.querySelector(".sub").textContent = [l.room, describe(l.state)].filter(Boolean).join(" · ");
+    const blink = row.querySelector(".blink");
+    blink.setAttribute("aria-label", `Blink ${l.label}`);
+    blink.onclick = () => send("/api/blink", { target: l.device });
+    const toggle = row.querySelector(".switch");
+    toggle.setAttribute("aria-checked", String(isOn));
+    toggle.setAttribute("aria-label", l.label);
+    toggle.onclick = () => send("/api/set", { target: l.device, power: isOn ? "off" : "on" });
+    return row;
+  }));
+  renderScenes();
+}
+
+// A kind ("bulbs") lists its own scenes in Govee's groups. "All" and rooms list the scenes every kind shares
+// first, then each kind's own ("Floor lamps only · Planet"), which start on just that kind.
+function renderScenes() {
+  const names = scenes.kinds[target] || scenes.common;
+  $("#favorites").replaceChildren(...FAVORITES.filter((name) => names.includes(name)).map((name) => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.textContent = name;
+    b.onclick = () => send("/api/govee-scene", { target, name });
+    return b;
+  }));
+  const groups = [];  // [label, scene names, which lights]
+  const own = (scenes.categories || {})[target];
+  if (own) {
+    own.forEach((category) => groups.push([category.name, category.scenes, target]));
+  } else {
+    groups.push(["Every light", scenes.common, target]);
+    Object.entries(scenes.categories || {}).forEach(([kind, categories]) => categories.forEach((category) => {
+      const extra = category.scenes.filter((name) => !scenes.common.includes(name));
+      if (extra.length) groups.push([`${title(kind)} only · ${category.name}`, extra, kind]);
+    }));
+  }
+  const total = groups.reduce((sum, group) => sum + group[1].length, 0);
+  $("#scene-pick").replaceChildren(new Option(`More scenes (${total})…`, ""), ...groups.map(([label, list, lights]) => {
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = label;
+    list.forEach((name) => {
+      const option = new Option(name, name);
+      option.dataset.target = lights;
+      optgroup.append(option);
+    });
+    return optgroup;
+  }));
+  const needKey = scenes.key_saved ? [] : scenes.need_key.filter((kind) => target === "all" || !scenes.kinds[target] || kind === target);
+  $("#scene-note").hidden = !needKey.length;
+  $("#scene-note").textContent = needKey.length
+    ? `The ${needKey.join(" and ")} need the Govee API key for scenes (box at the bottom).` : "";
+  $("#key-status").textContent = scenes.key_saved ? "Saved" : "Not saved";
+}
+
+async function loadScenes() {
+  try {
+    const data = await (await fetch("/api/scenes", { cache: "no-store" })).json();
+    if (!data.error) {
+      scenes = data;
+      renderScenes();
+    }
+  } catch (e) {}
+}
+
+async function load(rescan) {
+  try {
+    const res = await fetch("/api/lights" + (rescan ? "?rescan=1" : ""), { cache: "no-store" });
+    const data = await res.json();
+    if (data.error) {
+      $("#summary").textContent = data.error;
+      return;
+    }
+    lights = data.lights;
+    render(data.groups);
+  } catch (e) {
+    $("#summary").textContent = "Can't reach your Mac. Is it on, and is this phone on the home Wi-Fi?";
+  }
+}
+
+async function send(path, body) {
+  if (busy) return;
+  busy = true;
+  document.body.classList.add("busy");
+  try {
+    const res = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    toast(data.text, !data.ok);
+  } catch (e) {
+    toast("Your Mac didn't answer.", true);
+  } finally {
+    busy = false;
+    document.body.classList.remove("busy");
+    load();
+  }
+}
+
+const change = (settings) => send("/api/set", { target, ...settings });
+
+document.querySelectorAll(".scene").forEach((b) => {
+  b.onclick = () => send(`/api/scene/${b.dataset.scene}`, { target });
+});
+
+$("#whites").replaceChildren(...Object.entries(WHITES).map(([word, kelvin]) => {
+  const b = document.createElement("button");
+  b.className = "chip";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  dot.style.background = kelvinColor(kelvin);
+  b.append(dot, title(word));
+  b.onclick = () => change({ temperature: word });
+  return b;
+}));
+
+$("#colors").replaceChildren(...Object.entries(COLORS).map(([word, hex]) => {
+  const b = document.createElement("button");
+  b.className = "swatch";
+  b.style.background = hex;
+  b.setAttribute("aria-label", title(word));
+  b.onclick = () => change({ color: word });
+  return b;
+}));
+
+$("#brightness").oninput = (e) => { $("#level").textContent = `${e.target.value}%`; };
+$("#brightness").onchange = (e) => change({ brightness: Number(e.target.value) });
+$("#kelvin").oninput = (e) => { $("#kelvin-level").textContent = `${e.target.value}K`; };
+$("#kelvin").onchange = (e) => change({ temperature: Number(e.target.value) });
+$("#custom-color").onchange = (e) => change({ color: e.target.value });  // fires once, when the picker closes
+$("#refresh").onclick = () => {
+  $("#summary").textContent = "Looking for lights…";
+  load(true);
+};
+$("#scene-pick").onchange = (e) => {
+  const option = e.target.selectedOptions[0];
+  if (option && option.value) send("/api/govee-scene", { target: option.dataset.target || target, name: option.value });
+  e.target.value = "";
+};
+$("#save-key").onclick = async () => {
+  const key = $("#key").value.trim();
+  if (!key) return;
+  $("#key").value = "";
+  await send("/api/govee-key", { key });
+  loadScenes();
+};
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+load();
+loadScenes();
+</script>
+</body>
+</html>

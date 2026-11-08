@@ -12,9 +12,12 @@ Run `python3 govee_lan.py --help` for the command line, or use govee_mcp.py as a
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -37,7 +40,22 @@ def _data_dir() -> str:
 DATA_DIR = _data_dir()
 LIGHTS_FILE = os.path.join(DATA_DIR, "lights.json")
 
-KINDS = {"H6008": "bulb", "H60B2": "floor lamp"}
+# What to call each model, so lights get labels like "strip 2" and can be picked out by kind ("the strips").
+# A model missing here falls back to its family (MODEL_FAMILIES), then to "light". Labels only: every model with
+# LAN Control is found and controlled the same way.
+KINDS = {
+    **dict.fromkeys(["H6008", "H6009"], "bulb"),
+    **dict.fromkeys(["H6072", "H6076", "H6078", "H607C", "H60B2"], "floor lamp"),
+    **dict.fromkeys(["H6022", "H6051"], "table lamp"),
+    **dict.fromkeys(["H6046", "H6047", "H6056"], "light bar"),
+    **dict.fromkeys(["H6061", "H6062", "H6065", "H6066", "H606A"], "panel"),
+    **dict.fromkeys(["H60A0", "H60A1"], "ceiling light"),
+    **dict.fromkeys(["H6168", "H6199"], "tv backlight"),
+    **dict.fromkeys(["H7020", "H7021", "H7028", "H7041", "H7042", "H7050", "H7055", "H7060", "H705A", "H705B",
+                     "H705C"], "outdoor light"),
+    "H70B1": "curtain light",
+}
+MODEL_FAMILIES = {"H61": "strip", "H70": "outdoor light"}  # by the start of the model number; add yours
 TEMPERATURES = {"warm": 2700, "soft": 3000, "neutral": 4000, "cool": 5500, "daylight": 6500}
 WHITES = {"white": 4000, "warm white": 2700, "soft white": 3000, "cool white": 5500}
 COLORS = {
@@ -64,7 +82,13 @@ class Light:
 
     @property
     def kind(self) -> str:
-        return KINDS.get(self.sku, "light")
+        return kind_of(self.sku)
+
+
+def kind_of(sku: str) -> str:
+    """"bulb", "strip" and so on for a model number; "light" when it's unknown."""
+    sku = str(sku or "").upper()
+    return KINDS.get(sku) or next((kind for start, kind in MODEL_FAMILIES.items() if sku.startswith(start)), "light")
 
 
 # --- the wire protocol ---
@@ -108,16 +132,65 @@ def _listener(timeout: float) -> socket.socket:
     raise GoveeError(f"UDP port {LISTEN_PORT} is busy, so the lights can't answer. Is another Govee program running?")
 
 
+def local_addresses() -> list[str]:
+    """This computer's private IPv4 addresses, one per network it's on (Wi-Fi, Ethernet, a VPN...).
+
+    The scan goes out on each, because the system's default network isn't always the one the lights are on: with
+    a VPN up, a plain multicast leaves through the VPN and no light hears it. Empty if they can't be listed."""
+    commands = [["/sbin/ifconfig"], ["ifconfig"], ["ip", "-o", "-4", "addr", "show"]]
+    for command in commands:
+        try:
+            out = subprocess.run(command, capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        found = []
+        for word in re.findall(r"\binet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out):
+            try:
+                ip = ipaddress.ip_address(word)
+            except ValueError:
+                continue
+            if ip.is_private and not ip.is_loopback and not ip.is_link_local and word not in found:
+                found.append(word)
+        if out:
+            return found
+    return []
+
+
+def manual_addresses() -> list[str]:
+    """Lights to ask directly, from $GOVEE_LIGHT_IPS (commas or spaces), for networks that block multicast."""
+    return [ip for ip in re.split(r"[,\s]+", os.environ.get("GOVEE_LIGHT_IPS", "")) if ip]
+
+
+def _probe(s: socket.socket, probe: bytes, interfaces: list[str], direct: list[str]) -> None:
+    """One round of the scan: the multicast on every network, then a direct ask to each listed light."""
+    sent = False
+    for address in interfaces:
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
+            s.sendto(probe, SCAN_ADDR)
+            sent = True
+        except OSError:
+            continue  # a network that went away, or one that can't multicast
+    if not sent:
+        _sendto(s, probe, SCAN_ADDR)  # the system's default network; raises a plain-words error if it can't
+    for ip in direct:
+        try:
+            s.sendto(probe, (ip, SCAN_ADDR[1]))
+        except OSError:
+            pass
+
+
 def scan(timeout: float = 1.5, expect: int = 0) -> list[Light]:
     """Find the lights that have LAN Control on. Stops early once `expect` lights have answered."""
     found: dict[str, Light] = {}
     probe = _packet("scan", {"account_topic": "reserve"})
+    interfaces, direct = local_addresses(), manual_addresses()
     with _listener(0.2) as s:
-        _sendto(s, probe, SCAN_ADDR)
+        _probe(s, probe, interfaces, direct)
         start, resent = time.monotonic(), False
         while time.monotonic() - start < timeout and not (expect and len(found) >= expect):
             if not resent and time.monotonic() - start > timeout / 2:
-                _sendto(s, probe, SCAN_ADDR)
+                _probe(s, probe, interfaces, direct)
                 resent = True
             try:
                 data, (ip, _port) = s.recvfrom(4096)
@@ -255,9 +328,37 @@ def known_lights(rescan: bool = False) -> list[Light]:
             if entry.get("ip") != light.ip or entry.get("sku") != light.sku:
                 entry.update(ip=light.ip, sku=light.sku)
                 changed = True
+        changed = _name_from_govee_app(registry) or changed
         if changed:
             _write_registry(registry)
     return _labelled(registry)
+
+
+def account_devices() -> list[dict]:
+    """The lights in the person's Govee account ({"device", "sku", "deviceName"}), or [] without an API key."""
+    import govee_scenes  # here, not at the top: govee_scenes imports this module
+    return govee_scenes.account_devices()
+
+
+def _name_from_govee_app(registry: dict) -> bool:
+    """Give each unnamed light the name it has in the Govee Home app, when a key lets us ask. Names given here
+    are never replaced, and a name two lights share in the app is skipped. True if anything changed."""
+    taken = {entry.get("name", "").lower() for entry in registry.values() if entry.get("name")}
+    names: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for item in account_devices():
+        name = " ".join(str(item.get("deviceName") or "").split())
+        if item.get("device") and name:
+            names[item["device"]] = name
+            counts[name.lower()] = counts.get(name.lower(), 0) + 1
+    changed = False
+    for device, entry in registry.items():
+        name = names.get(device, "")
+        if name and not entry.get("name") and counts[name.lower()] == 1 and name.lower() not in taken:
+            entry["name"] = name
+            taken.add(name.lower())
+            changed = True
+    return changed
 
 
 def _refresh_addresses(lights: list[Light]) -> list[Light]:
@@ -266,7 +367,8 @@ def _refresh_addresses(lights: list[Light]) -> list[Light]:
 
 
 def _keys(light: Light) -> set:
-    keys = {light.label.lower(), light.ip, light.device.lower(), light.sku.lower(), light.kind, light.kind + "s"}
+    kind = light.kind.lower()
+    keys = {light.label.lower(), light.ip, light.device.lower(), light.sku.lower(), kind, kind + "s"}
     if light.name:
         keys.add(light.name.lower())
     if light.room:
@@ -402,14 +504,27 @@ NO_LIGHTS = "No Govee lights answered. Check that LAN Control is on for each lig
 def list_lights() -> str:
     lights = known_lights(rescan=True)
     if not lights:
-        return NO_LIGHTS
+        return NO_LIGHTS + "".join("\n" + line for line in _not_on_the_network([]))
     states = status(lights)
     lines = [f"{len(lights)} lights:"]
     for light in lights:
         room = f" ({light.room})" if light.room else ""
         lines.append(f"- {light.label}{room}: {describe(states.get(light.device, {}))}"
                      f"  [{light.sku} at {light.ip}, id {light.device}]")
+    lines += _not_on_the_network(lights)
     return "\n".join(lines)
+
+
+def _not_on_the_network(lights: list[Light]) -> list[str]:
+    """Lights the Govee account has that didn't answer here: LAN Control is off, or the model doesn't have it."""
+    here = {light.device for light in lights}
+    missing = [item for item in account_devices() if item.get("device") and item["device"] not in here]
+    if not missing:
+        return []
+    return [f"Also in your Govee account, but not answering on this network ({len(missing)}):"] + [
+        f"- {item.get('deviceName') or item['device']} ({item.get('sku', '?')})" for item in missing] + [
+        "Turn on LAN Control for them in the Govee Home app (the light, then the gear). Bluetooth-only models "
+        "don't have it."]
 
 
 def set_lights(target="all", power=None, brightness=None, color=None, temperature=None) -> str:

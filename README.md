@@ -23,8 +23,18 @@ python3 govee/govee_lan.py name "bulb 3" "desk lamp" --room office
 python3 govee/govee_lan.py set office --power off
 ```
 
-Targets: `all` (default), a name, a room, a kind (`bulbs`, `floor lamps`), a label (`bulb 3`), an IP or a device
-ID; comma-separate several. On first run macOS asks for Local Network access; allow it.
+Targets: `all` (default), a name, a room, a kind (`bulbs`, `strips`, `floor lamps`, `light bars`...), a label
+(`strip 2`), an IP or a device ID; comma-separate several. On first run macOS asks for Local Network access; allow it.
+
+## Finding lights
+
+- Every model with LAN Control is found, whatever it is. Known models get labels like `strip 1` or `panel 2`;
+  others show as `light 1`. Add yours to `KINDS` in `govee/govee_lan.py`.
+- The scan goes out on every network the Mac is on, so a VPN or a second interface doesn't hide the lights.
+- If your router blocks multicast (some mesh systems and guest networks do), list the lights' IPs:
+  `GOVEE_LIGHT_IPS="192.168.1.20,192.168.1.21"`.
+- With a Govee API key set (see Scenes), `list` names unnamed lights after the names in the Govee Home app, and
+  lists any light in your account that didn't answer, which usually means LAN Control is off for it.
 
 ## Mac apps
 
@@ -69,15 +79,15 @@ Scene lists come from Govee's public scene library (cached a week).
 - H60B2 takes scenes over the LAN (`ptReal` packets).
 - H6008 ignores `ptReal`, so its scenes use Govee's cloud API and need a free key (Govee Home → Profile → Settings
   → Apply for API Key). Paste it on the phone page or set `GOVEE_API_KEY`.
-- Other models: add yours to `LAN_SCENE_MODELS` in `govee/govee_scenes.py` if `ptReal` works, and to `KINDS` in
-  `govee/govee_lan.py` for a nicer label.
+- Other models: add yours to `LAN_SCENE_MODELS` in `govee/govee_scenes.py` if `ptReal` works for it.
 
 ## Config
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `GOVEE_LIGHTS_HOME` | lights list, scene cache, saved key | `~/Library/Application Support/govee-lights`, or `~/.config/govee-lights` on Linux |
-| `GOVEE_API_KEY` | cloud key (H6008 scenes only) | the key saved from the phone page |
+| `GOVEE_API_KEY` | cloud key: H6008 scenes, Govee app names, missing-light check | the key saved from the phone page |
+| `GOVEE_LIGHT_IPS` | lights to ask directly when multicast is blocked | none |
 | `GOVEE_HUB` | hub URL for the MCP server; empty means go direct | `http://127.0.0.1:8737` |
 | `LIGHTS_PAGE_PORT` | hub port (the menu bar app expects 8737) | `8737` |
 
@@ -85,7 +95,7 @@ Scene lists come from Govee's public scene library (cached a week).
 
 ## Protocol notes
 
-- Scan: multicast to 239.255.255.250:4001; replies arrive on :4002.
+- Scan: multicast to 239.255.255.250:4001 on each interface, plus unicast to `GOVEE_LIGHT_IPS`; replies arrive on :4002.
 - Commands go to :4003 (`turn`, `brightness`, `colorwc`); `devStatus` reads state back.
 - Each change is verified and resent to lights that missed it, up to twice.
 - Only one process can listen on :4002 at a time, so it binds briefly per call.

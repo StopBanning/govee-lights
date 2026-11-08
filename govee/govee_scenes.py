@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -168,6 +169,23 @@ def save_key(key: str) -> str:
         f.write(key + "\n")
     os.replace(tmp, KEY_FILE)
     return f"Saved. Govee's cloud knows {len(devices)} of your devices, so bulb scenes can start."
+
+
+def account_devices() -> list:
+    """The lights in the Govee account, cached for a day; [] without a key or when Govee can't be reached.
+    Only real lights: plugs, sensors, groups and DreamView scenes are left out."""
+    if not cloud_key():
+        return []
+
+    def fetch():
+        return [{"device": item.get("device"), "sku": item.get("sku"), "deviceName": item.get("deviceName")}
+                for item in _cloud("/user/devices").get("data") or []
+                if item.get("device") and str(item.get("type") or "devices.types.light").endswith(".light")
+                and re.fullmatch(r"H[0-9A-Z]{4,6}", str(item.get("sku") or ""))]  # not groups or DreamView scenes
+    try:
+        return _cached("account-devices.json", DAY, fetch)
+    except GoveeError:
+        return []
 
 
 def cloud_scenes(light: govee_lan.Light) -> dict:

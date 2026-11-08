@@ -452,6 +452,88 @@ class BulbScenes(Base):
             govee_scenes.save_key("has a space")
 
 
+class Detection(Base):
+    """Finding every light: model labels, every network, listed addresses, and the Govee app's names."""
+
+    registry = {"AA:01": {"ip": "10.0.0.5", "sku": "H6008"}, "AA:02": {"ip": "10.0.0.6", "sku": "H619A"},
+                "AA:03": {"ip": "10.0.0.7", "sku": "H6199"}, "AA:04": {"ip": "10.0.0.8", "sku": "H9999"}}
+
+    def test_kinds(self):
+        self.assertEqual([govee_lan.kind_of(sku) for sku in ("H6008", "h619a", "H6199", "H7041", "H9999", "")],
+                         ["bulb", "strip", "tv backlight", "outdoor light", "light", "light"])
+        labels = [light.label for light in govee_lan.known_lights()]
+        self.assertEqual(sorted(labels), ["bulb 1", "light 1", "strip 1", "tv backlight 1"])
+        self.assertEqual([light.device for light in govee_lan.resolve("strips", govee_lan.known_lights())], ["AA:02"])
+        self.assertEqual(len(govee_lan.resolve("TV Backlights", govee_lan.known_lights())), 1)
+
+    def test_local_addresses(self):
+        ifconfig = ("lo0: flags=8049<UP,LOOPBACK>\n\tinet 127.0.0.1 netmask 0xff000000\n"
+                    "en0: flags=8863<UP>\n\tinet 192.168.1.23 netmask 0xffffff00 broadcast 192.168.1.255\n"
+                    "en1: flags=8863<UP>\n\tinet 169.254.3.4 netmask 0xffff0000\n"
+                    "utun4: flags=8051<UP>\n\tinet 10.8.0.2 --> 10.8.0.1 netmask 0xffffffff\n"
+                    "en5: flags=8863<UP>\n\tinet 8.8.4.4 netmask 0xffffff00\n")
+        run = patch(self, govee_lan.subprocess, "run", mock.Mock(return_value=mock.Mock(stdout=ifconfig)))
+        self.assertEqual(govee_lan.local_addresses(), ["192.168.1.23", "10.8.0.2"])
+        run.side_effect = OSError
+        self.assertEqual(govee_lan.local_addresses(), [])
+
+    def test_manual_addresses(self):
+        with mock.patch.dict(os.environ, {"GOVEE_LIGHT_IPS": " 10.0.0.9, 10.0.0.10 10.0.0.11,"}):
+            self.assertEqual(govee_lan.manual_addresses(), ["10.0.0.9", "10.0.0.10", "10.0.0.11"])
+        with mock.patch.dict(os.environ, {"GOVEE_LIGHT_IPS": ""}):
+            self.assertEqual(govee_lan.manual_addresses(), [])
+
+    def test_probe_goes_out_on_every_network_and_to_listed_lights(self):
+        sock = mock.Mock()
+        govee_lan._probe(sock, b"probe", ["192.168.1.23", "10.8.0.2"], ["10.0.0.9"])
+        self.assertEqual([c.args[2] for c in sock.setsockopt.call_args_list],
+                         [socket.inet_aton("192.168.1.23"), socket.inet_aton("10.8.0.2")])
+        self.assertEqual([c.args[1] for c in sock.sendto.call_args_list],
+                         [govee_lan.SCAN_ADDR, govee_lan.SCAN_ADDR, ("10.0.0.9", 4001)])
+
+    def test_probe_falls_back_to_the_default_network(self):
+        sock = mock.Mock()
+        sock.setsockopt.side_effect = OSError
+        govee_lan._probe(sock, b"probe", ["192.168.1.23"], [])
+        self.assertEqual([c.args[1] for c in sock.sendto.call_args_list], [govee_lan.SCAN_ADDR])
+
+    def test_names_from_the_govee_app(self):
+        registry = {"AA:01": {"sku": "H6008"}, "AA:02": {"sku": "H6008", "name": "desk"},
+                    "AA:03": {"sku": "H6008"}, "AA:04": {"sku": "H6008"}, "AA:05": {"sku": "H6008"}}
+        patch(self, govee_lan, "account_devices", lambda: [
+            {"device": "AA:01", "deviceName": "  Bedroom   Lamp "}, {"device": "AA:02", "deviceName": "Kitchen"},
+            {"device": "AA:03", "deviceName": "Twin"}, {"device": "AA:04", "deviceName": "twin"},
+            {"device": "AA:05", "deviceName": "Desk"}])
+        self.assertTrue(govee_lan._name_from_govee_app(registry))
+        self.assertEqual({d: e.get("name", "") for d, e in registry.items()},
+                         {"AA:01": "Bedroom Lamp", "AA:02": "desk", "AA:03": "", "AA:04": "", "AA:05": ""})
+        self.assertFalse(govee_lan._name_from_govee_app(registry))
+
+    def test_lights_missing_from_the_network_are_listed(self):
+        patch(self, govee_lan, "account_devices", lambda: [{"device": "AA:01", "sku": "H6008", "deviceName": "a"},
+                                                            {"device": "ZZ:09", "sku": "H6159", "deviceName": "Shelf"}])
+        lines = govee_lan._not_on_the_network(govee_lan.known_lights())
+        self.assertIn("- Shelf (H6159)", lines)
+        self.assertEqual(len(lines), 3)
+        patch(self, govee_lan, "account_devices", lambda: [])
+        self.assertEqual(govee_lan._not_on_the_network(govee_lan.known_lights()), [])
+
+    def test_account_devices(self):
+        self.assertEqual(govee_scenes.account_devices(), [])  # no key: never asks Govee
+        os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
+        with open(self.key_file, "w") as f:
+            f.write("key\n")
+        cloud = patch(self, govee_scenes, "_cloud", mock.Mock(return_value={"data": [
+            {"device": "AA:01", "sku": "H6008", "deviceName": "Lamp", "type": "devices.types.light"},
+            {"device": "PP:01", "sku": "H5080", "deviceName": "Plug", "type": "devices.types.socket"},
+            {"device": "AA:02", "sku": "H619A", "deviceName": "Strip"},
+            {"device": "GG:01", "sku": "SameModeGroup", "deviceName": "Same-Model", "type": "devices.types.light"},
+            {"device": "GG:02", "sku": "DreamViewScenic", "deviceName": "Scenic", "type": "devices.types.light"}]}))
+        self.assertEqual([item["device"] for item in govee_scenes.account_devices()], ["AA:01", "AA:02"])
+        self.assertEqual([item["device"] for item in govee_scenes.account_devices()], ["AA:01", "AA:02"])
+        self.assertEqual(cloud.call_count, 1)  # cached
+
+
 class Mcp(unittest.TestCase):
     def setUp(self):
         patch(self, govee_mcp, "HUB", "")

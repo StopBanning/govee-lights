@@ -42,6 +42,8 @@ final class LightsMenu: NSObject, NSMenuDelegate {
     private var sceneCategories: [String: [(name: String, scenes: [String])]] = [:]  // each kind's, in Govee's groups
     private var pickerLights = "all"  // which lights the color picker is choosing for
     private var pickerTimer: Timer?
+    private var followingSpotify = false  // the hub's "Follow Spotify" switch
+    private var spotifyNote = ""  // the song it's following, or why it can't
 
     override init() {
         super.init()
@@ -95,6 +97,17 @@ final class LightsMenu: NSObject, NSMenuDelegate {
         }
         if commonScenes.isEmpty {
             refreshScenes()
+        }
+        menu.addItem(.separator())
+        let follow = NSMenuItem(title: "Follow Spotify", action: #selector(toggleSpotify), keyEquivalent: "")
+        follow.target = self
+        follow.state = followingSpotify ? .on : .off
+        follow.toolTip = "The lights take each song's album-art colors while Spotify plays."
+        menu.addItem(follow)
+        if followingSpotify && !spotifyNote.isEmpty {
+            let note = NSMenuItem(title: spotifyNote, action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
         }
         menu.addItem(.separator())
         let page = NSMenuItem(title: "Open the Lights Page", action: #selector(openPage), keyEquivalent: "")
@@ -259,6 +272,22 @@ final class LightsMenu: NSObject, NSMenuDelegate {
         postJSON("api/govee-scene", ["name": pick[0], "target": pick[1]], timeout: 30)
     }
 
+    @objc private func toggleSpotify() {
+        followingSpotify.toggle()
+        var request = URLRequest(url: hub.appendingPathComponent("api/spotify"), timeoutInterval: 10)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": followingSpotify])
+        call(request) { reply in
+            self.followingSpotify = reply?["enabled"] as? Bool ?? self.followingSpotify
+        }
+    }
+
+    // A color, scene or slider from the menu ends following on the hub; mirror that here.
+    private func stopFollowing() {
+        followingSpotify = false
+    }
+
     @objc private func colorPicked(_ sender: ColorButton) {
         statusItem.menu?.cancelTracking()
         postJSON("api/set", ["target": sender.lights, "color": sender.colorName], timeout: 20)
@@ -304,6 +333,7 @@ final class LightsMenu: NSObject, NSMenuDelegate {
 
     // Sends a change to the hub. A full success refreshes the icon; anything else shows the hub's words.
     private func perform(_ request: URLRequest) {
+        stopFollowing()
         symbol = "ellipsis.circle"
         show()
         call(request) { reply in
@@ -318,6 +348,7 @@ final class LightsMenu: NSObject, NSMenuDelegate {
     }
 
     private func refresh() {
+        refreshSpotify()
         call(URLRequest(url: hub.appendingPathComponent("api/lights"), timeoutInterval: 10)) { reply in
             guard let reply = reply, let lights = reply["lights"] as? [[String: Any]] else {
                 self.summary = reply?["error"] as? String ?? "The lights hub isn't running."
@@ -333,6 +364,21 @@ final class LightsMenu: NSObject, NSMenuDelegate {
             self.groups = (reply["groups"] as? [String] ?? []).filter { $0 != "all" }
             self.symbol = on > 0 ? "lightbulb.fill" : "lightbulb"
             self.show()
+        }
+    }
+
+    private func refreshSpotify() {
+        call(URLRequest(url: hub.appendingPathComponent("api/spotify"), timeoutInterval: 10)) { reply in
+            guard let reply = reply else { return }
+            self.followingSpotify = reply["enabled"] as? Bool ?? false
+            let track = reply["track"] as? [String: Any] ?? [:]
+            if let problem = reply["problem"] as? String, !problem.isEmpty {
+                self.spotifyNote = "Can't reach Spotify: allow Lights Hub in Automation settings"
+            } else if let name = track["name"] as? String, let artist = track["artist"] as? String {
+                self.spotifyNote = "♪ \(name) – \(artist)"
+            } else {
+                self.spotifyNote = "Waiting for Spotify to play"
+            }
         }
     }
 

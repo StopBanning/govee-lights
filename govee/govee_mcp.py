@@ -113,6 +113,38 @@ TOOLS = [
     },
 ]
 
+TOOLS += [
+    {
+        "name": "follow_spotify",
+        "title": "Follow Spotify",
+        "description": "Switch on or off the lights following Spotify: while it plays on the Mac, the lights take the "
+                       "colors of each song's album art. Picking any other color or scene switches it off.",
+        "inputSchema": {"type": "object", "properties": {"on": {"type": "boolean"}}, "required": ["on"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    },
+    {
+        "name": "spotify_status",
+        "title": "Spotify status",
+        "description": "Whether the lights are following Spotify, and the current song and its colors.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+    },
+]
+FOLLOWER = None  # the hub's Follower, set by lights_page.py; following runs only inside the hub
+
+
+def _follower():
+    if FOLLOWER is None:
+        raise govee_lan.GoveeError("following Spotify runs inside Lights Hub, which isn't running: start it with "
+                                   "mac/install.sh")
+    return FOLLOWER
+
+
+def _follow(on) -> str:
+    _follower().set(on is True or str(on).lower() in ("true", "on", "yes", "1"))
+    return _follower().describe()
+
+
 HANDLERS = {
     "list_lights": lambda a: govee_lan.list_lights(),
     "set_lights": lambda a: govee_lan.set_lights(a.get("target") or "all", a.get("power"), a.get("brightness"),
@@ -121,6 +153,8 @@ HANDLERS = {
     "name_light": lambda a: govee_lan.name_light(a["target"], a["name"], a.get("room") or ""),
     "list_scenes": lambda a: govee_scenes.list_scenes(a.get("target") or "all"),
     "start_scene": lambda a: govee_scenes.start_scene(a.get("target") or "all", a["name"])["text"],
+    "follow_spotify": lambda a: _follow(a.get("on")),
+    "spotify_status": lambda a: _follower().describe(),
 }
 
 
@@ -164,7 +198,7 @@ def _error(mid, code: int, message: str) -> dict:
 
 def _call(name: str, args: dict) -> dict:
     schema = next(tool["inputSchema"] for tool in TOOLS if tool["name"] == name)
-    missing = [key for key in schema.get("required", []) if not args.get(key)]
+    missing = [key for key in schema.get("required", []) if args.get(key) in (None, "")]
     hub = None if missing else _via_hub(name, args)
     if missing:
         text, is_error = "Missing: " + ", ".join(missing), True

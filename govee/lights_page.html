@@ -102,6 +102,8 @@
   }
   #toast.show { opacity: 1; transform: none; }
   #toast.warn { background: var(--warn); color: #fff; }
+  .spotify-colors { display: flex; gap: 8px; margin-top: 10px; }
+  .spotify-colors span { width: 28px; height: 28px; border-radius: 50%; }
 </style>
 </head>
 <body>
@@ -123,6 +125,14 @@
       <button class="scene" data-scene="dim"><span class="dot" style="background:#9a6a3a"></span>Dim</button>
       <button class="scene" data-scene="off"><span class="dot" style="background:var(--off)"></span>Off</button>
     </div>
+  </section>
+
+  <section class="card" aria-label="Follow Spotify">
+    <p class="label"><span>Follow Spotify</span>
+      <button class="chip" id="spotify" aria-pressed="false">Off</button></p>
+    <p class="note" id="spotify-note">The lights take each song's album-art colors while Spotify plays on the Mac.
+      Picking any other look turns it off.</p>
+    <div class="spotify-colors" id="spotify-colors"></div>
   </section>
 
   <section class="card">
@@ -353,6 +363,43 @@ async function load(rescan) {
   }
 }
 
+let following = false;
+
+function renderSpotify(data) {
+  following = !!data.enabled;
+  const button = $("#spotify");
+  button.setAttribute("aria-pressed", String(following));
+  button.textContent = following ? "On" : "Off";
+  const track = data.track || {};
+  let note = "The lights take each song's album-art colors while Spotify plays on the Mac. Picking any other look turns it off.";
+  if (following && data.problem) note = data.problem;
+  else if (following && track.name) note = `${track.name} – ${track.artist}`;
+  else if (following) note = "Waiting for Spotify to play.";
+  $("#spotify-note").textContent = note;
+  $("#spotify-colors").replaceChildren(...(following ? data.colors || [] : []).map((hex) => {
+    const dot = document.createElement("span");
+    dot.style.background = hex;
+    return dot;
+  }));
+}
+
+async function loadSpotify() {
+  try {
+    renderSpotify(await (await fetch("/api/spotify", { cache: "no-store" })).json());
+  } catch (e) { /* the lights card already says the Mac can't be reached */ }
+}
+
+$("#spotify").onclick = async () => {
+  try {
+    const res = await fetch("/api/spotify", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !following }),
+    });
+    renderSpotify(await res.json());
+  } catch (e) {
+    toast("Your Mac didn't answer.", true);
+  }
+};
+
 async function send(path, body) {
   if (busy) return;
   busy = true;
@@ -369,6 +416,7 @@ async function send(path, body) {
     busy = false;
     document.body.classList.remove("busy");
     load();
+    loadSpotify();
   }
 }
 
@@ -419,8 +467,10 @@ $("#save-key").onclick = async () => {
   await send("/api/govee-key", { key });
   loadScenes();
 };
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { load(); loadSpotify(); } });
+setInterval(() => { if (following && !document.hidden) loadSpotify(); }, 5000);  // the song changes on its own
 load();
+loadSpotify();
 loadScenes();
 </script>
 </body>

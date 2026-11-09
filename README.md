@@ -55,6 +55,20 @@ menu bar, the phone page, Shortcuts, MCP, and Govee's scenes, which go over Blue
 Packet format: see `govee/govee_ble.py`. Tested on an H617A; other Bluetooth models may need a different color
 command (send a PR).
 
+## Follow Spotify
+
+While Spotify plays on the Mac, the lights that are on take the colors of the current song's album art, and change
+with each song. Switch it with **Follow Spotify** in the menu bar, the card on the phone page, or the chat tool
+`follow_spotify`. Picking any other color, scene or preset turns it off, so they don't fight. Paused, ads, podcasts
+and lights that are off are left alone. The switch survives restarts.
+
+- No Spotify developer key: the hub asks the Spotify app over AppleScript every 3 seconds and acts once per song.
+  The first time, macOS asks whether **Lights Hub** may control Spotify: click OK. If you clicked Don't Allow,
+  it's in System Settings > Privacy & Security > Automation.
+- Colors: the artwork (from Spotify's image CDN) is shrunk to 24x24 with macOS's `sips`, then the most present
+  vivid colors are picked. Floor lamps get the main color; the other lights take turns with the rest.
+- `GET /api/spotify` gives the switch, song and colors; `POST /api/spotify` with `{"enabled": true}` switches it.
+
 ## Mac apps
 
 ```bash
@@ -77,7 +91,8 @@ Log: `~/Library/Logs/govee-lights-hub.log`.
 
 ## MCP
 
-Tools: `list_lights`, `set_lights`, `identify_light`, `name_light`, `list_scenes`, `start_scene`.
+Tools: `list_lights`, `set_lights`, `identify_light`, `name_light`, `list_scenes`, `start_scene`,
+`follow_spotify`, `spotify_status`.
 
 ```bash
 claude mcp add --scope user govee -- python3 "$PWD/govee/govee_mcp.py"
@@ -127,6 +142,6 @@ Scene lists come from Govee's public scene library (cached a week).
 python3 -m unittest discover -s govee -v
 ```
 
-Fake light on localhost, a fake Govee API and a fake Bluetooth app; never touches real devices.
+Fake light on localhost, a fake Govee API, a fake Bluetooth app and a fake Spotify; never touches real devices.
 
 Not affiliated with Govee. MIT license.

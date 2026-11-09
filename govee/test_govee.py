@@ -21,6 +21,7 @@ import govee_lan
 import govee_mcp
 import govee_scenes
 import lights_page
+import spotify_follow
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _ORIGINAL_RUN = govee_ble._run
@@ -110,6 +111,11 @@ class Base(unittest.TestCase):
         patch(self, govee_ble, "available", lambda: False)  # never the real Bluetooth app or lights
         patch(self, govee_ble, "_run", mock.Mock(side_effect=AssertionError("tried to use real Bluetooth")))
         patch(self, govee_ble, "_states", {})
+        self.follower = lights_page.Follower(os.path.join(folder, "follow-spotify.json"))  # never the real switch
+        patch(self, lights_page, "FOLLOWER", self.follower)
+        patch(self, govee_mcp, "FOLLOWER", self.follower)
+        for name in ("now_playing", "fetch", "pixels"):  # never real Spotify, downloads or sips
+            patch(self, spotify_follow, name, mock.Mock(side_effect=AssertionError(f"tried real {name}")))
         env = mock.patch.dict(os.environ, {"GOVEE_API_KEY": ""})  # a key in the shell must not leak in
         env.start()
         self.addCleanup(env.stop)
@@ -643,6 +649,97 @@ class Bluetooth(Base):
         self.assertNotIn("strips", govee_scenes.scene_lists("strip 1")["need_key"])
 
 
+class FollowSpotify(Base):
+    """The hub following Spotify, with Spotify, the artwork and sips stood in for."""
+
+    registry = ONE_FAKE_LIGHT
+    get, post = Page.get, Page.post
+
+    def setUp(self):
+        super().setUp()
+        self.light = self.start_light()
+        server = lights_page.ThreadingHTTPServer(("127.0.0.1", 0), lights_page.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.base = f"http://127.0.0.1:{server.server_address[1]}"
+        self.song = {"state": "playing", "id": "spotify:track:1", "artwork": "https://i.scdn.co/image/a",
+                     "name": "Song", "artist": "Band"}
+        patch(self, spotify_follow, "now_playing", lambda: dict(self.song))
+        patch(self, spotify_follow, "fetch", lambda url: b"art")
+        patch(self, spotify_follow, "pixels", lambda data: [(250, 20, 20)] * 30 + [(20, 20, 250)] * 10)
+        self.sets = []
+        real = govee_lan.set_lights_result
+        def recording(*args, **kwargs):
+            self.sets.append((args[0] if args else kwargs.get("target"), kwargs.get("color")))
+            return real(*args, **kwargs)
+        patch(self, govee_lan, "set_lights_result", recording)
+
+    def test_one_change_per_song(self):
+        self.assertFalse(self.follower.tick())  # off by default
+        self.light.state["onOff"] = 1
+        self.post("/api/spotify", {"enabled": True})
+        self.assertTrue(self.follower.tick())
+        self.assertEqual(self.sets, [("FAKE", "#1414ff")])  # a bulb takes the second color, at full brightness
+        self.assertEqual(self.light.state["color"], {"r": 20, "g": 20, "b": 255})
+        self.assertFalse(self.follower.tick())  # same song: nothing
+        self.song["id"] = "spotify:track:2"
+        self.assertTrue(self.follower.tick())
+        self.assertEqual(len(self.sets), 2)
+        status = json.loads(self.get("/api/spotify")[2])
+        self.assertEqual((status["enabled"], status["track"]["name"], status["colors"]),
+                         (True, "Song", ["#ff1414", "#1414ff"]))
+
+    def test_lights_that_are_off_stay_off(self):
+        self.light.state["onOff"] = 0
+        self.follower.set(True)
+        self.assertFalse(self.follower.tick())
+        self.assertEqual((self.sets, self.light.state["onOff"]), ([], 0))
+
+    def test_paused_ads_and_bad_art_leave_the_lights_alone(self):
+        self.follower.set(True)
+        self.song["state"] = "paused"
+        self.assertFalse(self.follower.tick())
+        self.song["state"] = "playing"
+        patch(self, spotify_follow, "fetch", mock.Mock(side_effect=ValueError("not Spotify artwork")))
+        self.assertFalse(self.follower.tick())
+        patch(self, spotify_follow, "now_playing", lambda: None)
+        self.assertFalse(self.follower.tick())
+        self.assertEqual(self.sets, [])
+
+    def test_a_look_picked_by_hand_turns_it_off(self):
+        for path, body in (("/api/set", {"color": "red"}), ("/api/scene/warm", {}),
+                           ("/api/tool/set_lights", {"color": "red"})):
+            self.follower.set(True)
+            self.post(path, body)
+            self.assertFalse(self.follower.enabled, path)
+        self.follower.set(True)
+        self.post("/api/blink", {"target": "bulb 1"})  # blinking isn't a look
+        self.assertTrue(self.follower.enabled)
+
+    def test_switch_is_remembered(self):
+        self.follower.set(True)
+        self.assertTrue(lights_page.Follower(self.follower.path).enabled)
+        self.follower.set(False)
+        self.assertFalse(lights_page.Follower(self.follower.path).enabled)
+
+    def test_not_allowed_is_reported(self):
+        self.follower.set(True)
+        patch(self, spotify_follow, "now_playing",
+              mock.Mock(side_effect=spotify_follow.SpotifyNotAllowed("allow it in Automation")))
+        self.assertFalse(self.follower.tick())
+        self.assertIn("Automation", self.follower.describe())
+
+    def test_chat_tools(self):
+        self.assertIn("is off", govee_mcp.run_local("spotify_status", {}))
+        self.assertTrue(govee_mcp.run_local("follow_spotify", {"on": True}).startswith("Following Spotify"))
+        self.assertTrue(self.follower.enabled)
+        reply = govee_mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "follow_spotify", "arguments": {"on": False}}})
+        self.assertFalse(reply["result"]["isError"])  # false is an answer, not a missing argument
+        self.assertFalse(self.follower.enabled)
+
+
 class Mcp(unittest.TestCase):
     def setUp(self):
         patch(self, govee_mcp, "HUB", "")
@@ -662,7 +759,7 @@ class Mcp(unittest.TestCase):
     def test_tools(self):
         names = [tool["name"] for tool in self.call("tools/list")["result"]["tools"]]
         self.assertEqual(names, ["list_lights", "set_lights", "identify_light", "name_light", "list_scenes",
-                                 "start_scene"])
+                                 "start_scene", "follow_spotify", "spotify_status"])
         self.assertEqual(self.call("tools/call", {"name": "fly"})["error"]["code"], -32602)
         missing = self.call("tools/call", {"name": "identify_light", "arguments": {}})["result"]
         self.assertTrue(missing["isError"])
@@ -678,7 +775,7 @@ class Mcp(unittest.TestCase):
                              capture_output=True, text=True, env={**os.environ, "GOVEE_HUB": ""}).stdout
         replies = [json.loads(line) for line in out.splitlines()]
         self.assertEqual([reply["id"] for reply in replies], [1, 2])
-        self.assertEqual(len(replies[1]["result"]["tools"]), 6)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 8)
 
 
 if __name__ == "__main__":

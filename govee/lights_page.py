@@ -11,8 +11,10 @@ import ipaddress
 import json
 import os
 import struct
+import subprocess
 import sys
 import threading
+import time
 import traceback
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,7 @@ sys.path.insert(0, HERE)
 import govee_lan  # noqa: E402
 import govee_mcp  # noqa: E402
 import govee_scenes  # noqa: E402
+import spotify_follow  # noqa: E402
 
 PORT = int(os.environ.get("LIGHTS_PAGE_PORT", "8737"))
 PAGE = os.path.join(HERE, "lights_page.html")
@@ -35,6 +38,98 @@ SCENES = {
     "bright": {"brightness": 100, "temperature": "neutral"},
     "dim": {"brightness": 15, "temperature": "warm"},
 }
+FOLLOW_FILE = os.path.join(govee_lan.DATA_DIR, "follow-spotify.json")
+MANUAL = {"/api/set", "/api/govee-scene", "/api/tool/set_lights", "/api/tool/start_scene"}  # these end following
+
+
+class Follower:
+    """While switched on and Spotify plays, give the lights that are on the colors of the track's album art: one
+    change per song, never per poll. Lights that are off stay off. Paused, stopped, ads and tracks without usable art
+    leave the lights as they are."""
+
+    def __init__(self, path: str = FOLLOW_FILE):
+        self.path = path
+        self.enabled = False
+        self.track: dict = {}
+        self.colors: list[str] = []
+        self.problem = ""
+        self.last_id = ""
+        try:
+            with open(path) as f:
+                self.enabled = bool(json.load(f).get("enabled"))
+        except (OSError, ValueError):
+            pass
+
+    def set(self, enabled: bool) -> dict:
+        if enabled != self.enabled:
+            self.enabled, self.last_id, self.problem = enabled, "", ""
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump({"enabled": enabled}, f)
+        return self.status()
+
+    def status(self) -> dict:
+        return {"enabled": self.enabled, "track": self.track, "colors": self.colors, "problem": self.problem}
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "Following Spotify is off."
+        text = "Following Spotify."
+        if self.track:
+            text += f" Now: {self.track.get('name')} by {self.track.get('artist')}"
+            text += f" ({', '.join(self.colors)})." if self.colors else "."
+        return text + (f" Problem: {self.problem}" if self.problem else "")
+
+    def tick(self) -> bool:
+        """One poll. True if the lights were changed."""
+        if not self.enabled:
+            return False
+        try:
+            playing = spotify_follow.now_playing()
+        except spotify_follow.SpotifyNotAllowed as e:
+            self.problem = str(e)
+            return False
+        if not playing or playing["state"] != "playing" or playing["id"] == self.last_id:
+            return False
+        self.last_id, self.problem = playing["id"], ""
+        self.track = {key: playing[key] for key in ("name", "artist", "id")}
+        try:
+            colors = spotify_follow.palette(spotify_follow.pixels(spotify_follow.fetch(playing["artwork"])))
+        except (ValueError, OSError, subprocess.SubprocessError):
+            self.colors = []  # an ad, a podcast, art that won't load: leave the lights alone
+            return False
+        self.colors = [spotify_follow.hex_color(c) for c in colors]
+        with LOCK:
+            if not self.enabled:  # switched off while the art was loading
+                return False
+            lights = govee_lan.known_lights()
+            states = govee_lan.status(lights)
+            lit = [light for light in lights if states.get(light.device, {}).get("onOff") == 1]  # off stays off
+            if not lit:
+                return False
+            plan = spotify_follow.assign(lit, colors)
+            groups: dict[tuple, list] = {}
+            for device, color in plan.items():
+                groups.setdefault(color, []).append(device)
+            missed = []
+            for color, devices in groups.items():
+                result = govee_lan.set_lights_result(",".join(devices), color=spotify_follow.hex_color(color))
+                missed += result["failed"]
+        print(f"Spotify: {self.track['name']} by {self.track['artist']} -> {', '.join(self.colors)}"
+              + (f"; missed {', '.join(missed)}" if missed else ""), file=sys.stderr, flush=True)
+        return True
+
+    def run(self, every: float = 3.0) -> None:
+        while True:
+            try:
+                self.tick()
+            except Exception:  # keep following through a bad moment
+                traceback.print_exc(file=sys.stderr)
+            time.sleep(every)
+
+
+FOLLOWER = Follower()
+govee_mcp.FOLLOWER = FOLLOWER  # so the chat tools follow_spotify and spotify_status reach it
 MANIFEST = {
     "name": "Lights", "short_name": "Lights", "start_url": "/", "display": "standalone",
     "background_color": "#1c1a21", "theme_color": "#1c1a21",
@@ -139,6 +234,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, {"error": str(e)})
         elif path == "/api/govee-key":
             self._json(200, {"saved": bool(govee_scenes.cloud_key())})  # never the key itself
+        elif path == "/api/spotify":
+            self._json(200, FOLLOWER.status())
         elif path == "/icon.png":
             self._send(200, ICON, "image/png", cache=True)
         elif path == "/manifest.webmanifest":
@@ -158,6 +255,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "text": "That request didn't make sense."})
         path, _, query = self.path.partition("?")
         target = body.get("target") or parse_qs(query).get("target", ["all"])[0]
+        if path == "/api/spotify":
+            return self._json(200, {"ok": True, **FOLLOWER.set(bool(body.get("enabled")))})
+        if path in MANUAL or path.startswith("/api/scene/"):
+            FOLLOWER.set(False)  # a look picked by hand wins: stop following so they don't fight
         if path == "/api/set":
             def action():
                 return govee_lan.set_lights_result(target, body.get("power"), body.get("brightness"),
@@ -203,6 +304,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     server = ThreadingHTTPServer(("", PORT), Handler)
     server.daemon_threads = True
+    threading.Thread(target=FOLLOWER.run, daemon=True).start()
     print(f"Lights page on port {PORT}", file=sys.stderr, flush=True)
     server.serve_forever()
 

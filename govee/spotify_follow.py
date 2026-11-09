@@ -31,18 +31,30 @@ class SpotifyNotAllowed(Exception):
     """macOS hasn't let this app control Spotify."""
 
 
+last_problem = ""  # why the last now_playing() got nothing, for the status line; "" when it worked
+
+
 def now_playing(run=subprocess.run) -> dict | None:
     """{"state", "id", "artwork", "name", "artist"} for Spotify's current track, or None when it isn't running.
     Never launches Spotify."""
+    global last_problem
     try:
         done = run(["osascript", "-e", SCRIPT], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        # Most often macOS's "wants to control Spotify" question, waiting on the screen.
+        last_problem = ("Spotify didn't answer. If macOS is asking whether Lights Hub may control Spotify, "
+                        "click OK.")
+        return None
+    except (OSError, subprocess.SubprocessError) as e:
+        last_problem = f"couldn't ask Spotify ({e})"
         return None
     if done.returncode != 0:
         if "-1743" in done.stderr or "not authorized" in done.stderr.lower():
             raise SpotifyNotAllowed("macOS hasn't let Lights Hub control Spotify. Allow it in System Settings > "
                                     "Privacy & Security > Automation.")
+        last_problem = "Spotify answered with an error: " + " ".join(done.stderr.split())[:160]
         return None
+    last_problem = ""
     fields = done.stdout.rstrip("\n").split(SEP)
     if len(fields) != 5:
         return None

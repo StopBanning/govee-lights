@@ -89,6 +89,7 @@ class Follower:
         except spotify_follow.SpotifyNotAllowed as e:
             self.problem = str(e)
             return False
+        self.problem = spotify_follow.last_problem if playing is None else ""
         if not playing or playing["state"] != "playing" or playing["id"] == self.last_id:
             return False
         self.last_id, self.problem = playing["id"], ""

@@ -19,8 +19,11 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
+
+import govee_ble
 
 SCAN_ADDR = ("239.255.255.250", 4001)
 LISTEN_PORT = 4002
@@ -79,6 +82,7 @@ class Light:
     name: str = ""
     room: str = ""
     label: str = ""  # the name if there is one, else "bulb 3" and so on
+    bluetooth: bool = False  # reached over Bluetooth (govee_ble), not the network; then device is a Mac-side id
 
     @property
     def kind(self) -> str:
@@ -205,9 +209,17 @@ def scan(timeout: float = 1.5, expect: int = 0) -> list[Light]:
 
 
 def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
-    """Ask lights for their state. Returns {device ID: state} for the ones that answered."""
-    by_ip = {light.ip: light for light in lights}
+    """Ask lights for their state. Returns {device ID: state} for the ones that answered. Bluetooth lights report
+    power and brightness only."""
     states: dict[str, dict] = {}
+    for light in lights:
+        if light.bluetooth:
+            state = govee_ble.state(light.device)
+            if state:
+                states[light.device] = state
+    by_ip = {light.ip: light for light in lights if not light.bluetooth}
+    if not by_ip:
+        return states
     ask = _packet("devStatus", {})
     with _listener(0.1) as s:
         for _round in range(2):
@@ -215,7 +227,7 @@ def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
                 if light.device not in states:
                     _sendto(s, ask, (ip, CONTROL_PORT))
             end = time.monotonic() + timeout / 2
-            while time.monotonic() < end and len(states) < len(by_ip):
+            while time.monotonic() < end and not all(light.device in states for light in by_ip.values()):
                 try:
                     data, (ip, _port) = s.recvfrom(4096)
                 except socket.timeout:
@@ -223,7 +235,7 @@ def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
                 msg = _parse(data)
                 if msg.get("cmd") == "devStatus" and ip in by_ip:
                     states[by_ip[ip].device] = msg.get("data") or {}
-            if len(states) == len(by_ip):
+            if all(light.device in states for light in by_ip.values()):
                 break
     return states
 
@@ -244,9 +256,20 @@ def _messages(change: dict) -> list[bytes]:
 
 
 def send(lights: list[Light], change: dict) -> None:
+    """Send a change without checking it. A Bluetooth light that can't be reached is skipped here; apply() and
+    the read-backs are where it shows."""
+    for light in lights:
+        if light.bluetooth:
+            try:
+                govee_ble.send(light.device, govee_ble.packets(change))
+            except govee_ble.BluetoothError:
+                pass
+    network = [light for light in lights if not light.bluetooth]
+    if not network:
+        return
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         for packet in _messages(change):
-            for light in lights:
+            for light in network:
                 _sendto(s, packet, (light.ip, CONTROL_PORT))
             time.sleep(0.05)
 
@@ -270,10 +293,40 @@ def matches(state: dict, change: dict) -> bool:
     return True
 
 
+def matches_bluetooth(state: dict, change: dict) -> bool:
+    """matches() for a Bluetooth light, which reports power and brightness but not color."""
+    if not state:
+        return False
+    if change.get("power") is False:
+        return state.get("onOff") == 0
+    return state.get("onOff") == 1 and (not change.get("brightness") or state.get("brightness") == change["brightness"])
+
+
+def _apply_bluetooth(lights: list[Light], change: dict) -> list[tuple[Light, dict]]:
+    """Each Bluetooth light: send, read back, and try once more if it didn't take. Returns the ones that didn't."""
+    failed = []
+    for light in lights:
+        state: dict = {}
+        for _attempt in range(2):
+            try:
+                state = govee_ble.apply(light.device, change)
+            except govee_ble.BluetoothError:
+                state = {}
+            if matches_bluetooth(state, change):
+                break
+        else:
+            failed.append((light, state))
+    return failed
+
+
 def apply(lights: list[Light], change: dict) -> list[tuple[Light, dict]]:
     """Send a change and check that it took, resending to stragglers up to twice (Wi-Fi bulbs drop packets).
 
     Returns (light, the state it last reported, or {} if it never answered) for each light that didn't confirm."""
+    failed = _apply_bluetooth([light for light in lights if light.bluetooth], change)
+    lights = [light for light in lights if not light.bluetooth]
+    if not lights:
+        return failed
     send(lights, change)
     pending, refreshed = list(lights), False
     for attempt, wait in enumerate((0.3, 0.6, 1.0)):
@@ -285,7 +338,7 @@ def apply(lights: list[Light], change: dict) -> list[tuple[Light, dict]]:
         if not refreshed and any(light.device not in heard for light in pending):
             pending, refreshed = _refresh_addresses(pending), True  # a silent light may have a new address
         send(pending, change)
-    return [(light, heard.get(light.device, {})) for light in pending]
+    return failed + [(light, heard.get(light.device, {})) for light in pending]
 
 
 # --- the list of known lights ---
@@ -308,7 +361,8 @@ def _write_registry(registry: dict) -> None:
 
 
 def _labelled(registry: dict) -> list[Light]:
-    lights = [Light(device, entry.get("sku", "?"), entry.get("ip", ""), entry.get("name", ""), entry.get("room", ""))
+    lights = [Light(device, entry.get("sku", "?"), entry.get("ip", ""), entry.get("name", ""), entry.get("room", ""),
+                    bluetooth=bool(entry.get("bluetooth")))
               for device, entry in registry.items()]
     lights.sort(key=lambda light: (light.kind, light.device))
     counts: dict[str, int] = {}
@@ -323,15 +377,53 @@ def known_lights(rescan: bool = False) -> list[Light]:
     registry = _read_registry()
     if rescan or not registry:
         changed = False
+        heard_over_bluetooth: list = []
+        listener = None
+        if govee_ble.available():  # alongside the network scan, which is shorter
+            def listen():
+                try:
+                    heard_over_bluetooth.extend(govee_ble.scan())
+                except govee_ble.BluetoothError:
+                    pass
+            listener = threading.Thread(target=listen, daemon=True)
+            listener.start()
         for light in scan():
             entry = registry.setdefault(light.device, {})
             if entry.get("ip") != light.ip or entry.get("sku") != light.sku:
                 entry.update(ip=light.ip, sku=light.sku)
                 changed = True
+        if listener:
+            listener.join(timeout=30)
+        changed = _add_bluetooth_lights(registry, heard_over_bluetooth) or changed
         changed = _name_from_govee_app(registry) or changed
         if changed:
             _write_registry(registry)
     return _labelled(registry)
+
+
+def _same_light(sku: str, suffix: str, device: str) -> bool:
+    """Whether a light heard over Bluetooth is one already reached over the network. Its advertised name ends in the
+    last four hex digits of its Bluetooth address, which is the Wi-Fi address (the end of the device ID) or one
+    more."""
+    try:
+        wifi = int(device.replace(":", "")[-4:], 16)
+        return abs(int(suffix, 16) - wifi) <= 2
+    except ValueError:
+        return False
+
+
+def _add_bluetooth_lights(registry: dict, heard: list[dict]) -> bool:
+    """Keep the Bluetooth-only lights among those heard. True if anything changed."""
+    network = [(entry.get("sku"), device) for device, entry in registry.items() if not entry.get("bluetooth")]
+    changed = False
+    for item in heard:
+        if any(sku == item["sku"] and _same_light(item["sku"], item["suffix"], device) for sku, device in network):
+            continue
+        entry = registry.setdefault(item["id"], {})
+        if entry.get("sku") != item["sku"] or not entry.get("bluetooth"):
+            entry.update(sku=item["sku"], bluetooth=True, ble_name=item.get("name", ""))
+            changed = True
+    return changed
 
 
 def account_devices() -> list[dict]:
@@ -361,7 +453,7 @@ def _name_from_govee_app(registry: dict) -> bool:
     return changed
 
 
-def _refresh_addresses(lights: list[Light]) -> list[Light]:
+def _refresh_addresses(lights: list[Light]) -> list[Light]:  # network lights only
     current = {light.device: light for light in known_lights(rescan=True)}
     return [current.get(light.device, light) for light in lights]
 
@@ -473,11 +565,17 @@ def parse_change(power=None, brightness=None, color=None, temperature=None) -> d
     return change
 
 
+def where(light: Light) -> str:
+    return "over Bluetooth" if light.bluetooth else f"at {light.ip}"
+
+
 def describe(state: dict) -> str:
     if not state:
         return "didn't answer"
     if state.get("onOff") != 1:
         return "off"
+    if "color" not in state and "colorTemInKelvin" not in state:  # a Bluetooth light: no color to report
+        return f"on, {state.get('brightness', '?')}%"
     kelvin = state.get("colorTemInKelvin") or 0
     color = state.get("color") or {}
     shade = f"white {kelvin}K" if kelvin else "color #{:02x}{:02x}{:02x}".format(
@@ -510,7 +608,7 @@ def list_lights() -> str:
     for light in lights:
         room = f" ({light.room})" if light.room else ""
         lines.append(f"- {light.label}{room}: {describe(states.get(light.device, {}))}"
-                     f"  [{light.sku} at {light.ip}, id {light.device}]")
+                     f"  [{light.sku} {where(light)}, id {light.device}]")
     lines += _not_on_the_network(lights)
     return "\n".join(lines)
 
@@ -556,13 +654,21 @@ def identify_light(target: str) -> str:
     if not state:
         raise GoveeError(f"{light.label} didn't answer, so it can't be blinked")
     was_on = 1 if state.get("onOff") == 1 else 0
+    if light.bluetooth:
+        try:  # one connection for all four steps would be quicker, but each step is its own short write
+            for value in (1 - was_on, was_on, 1 - was_on, was_on):
+                govee_ble.send(light.device, [govee_ble.packet(0x33, 0x01, value)])
+                time.sleep(0.3)
+        except govee_ble.BluetoothError as e:
+            raise GoveeError(f"{light.label}: {e}") from None
+        return f"Blinked {light.label} ({light.sku} over Bluetooth) twice and left it {'on' if was_on else 'off'}."
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         for value in (1 - was_on, was_on, 1 - was_on, was_on):
             _sendto(s, _packet("turn", {"value": value}), (light.ip, CONTROL_PORT))
             time.sleep(0.8)
         if status([light]).get(light.device, {}).get("onOff") != was_on:
             _sendto(s, _packet("turn", {"value": was_on}), (light.ip, CONTROL_PORT))
-    return f"Blinked {light.label} ({light.sku} at {light.ip}) twice and left it {'on' if was_on else 'off'}."
+    return f"Blinked {light.label} ({light.sku} {where(light)}) twice and left it {'on' if was_on else 'off'}."
 
 
 def name_light(target: str, name: str, room: str = "") -> str:

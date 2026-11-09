@@ -2,8 +2,10 @@
 # Builds the two small Mac apps next to this script, using the Swift compiler from Apple's command line tools:
 #   Lights Hub.app  runs ../govee/lights_page.py, so macOS asks about local network access for "Lights Hub"
 #   Lights.app      the menu bar button, which talks to the hub on port 8737
+#   Govee Bluetooth.app  carries commands to Bluetooth-only lights; macOS asks once about Bluetooth for it
 # Rebuilding changes the apps' ad-hoc signatures, so macOS may ask about Lights Hub's network access again.
-# `./build.sh menu` rebuilds only Lights.app, which needs no such permission; `./build.sh hub` only Lights Hub.
+# `./build.sh menu` rebuilds only Lights.app, which needs no such permission; `./build.sh hub` only Lights Hub;
+# `./build.sh bluetooth` only Govee Bluetooth (which may then ask about Bluetooth again).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,9 +22,11 @@ build() {  # build <app name> <executable> <swift file> <Info.plist>
 case "${1:-all}" in
   hub) build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist ;;
   menu) build "Lights" Lights Lights.swift Lights-Info.plist ;;
+  bluetooth) build "Govee Bluetooth" GoveeBluetooth GoveeBluetooth.swift GoveeBluetooth-Info.plist ;;
   all)
     build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist
     build "Lights" Lights Lights.swift Lights-Info.plist
+    build "Govee Bluetooth" GoveeBluetooth GoveeBluetooth.swift GoveeBluetooth-Info.plist
     ;;
-  *) echo "usage: build.sh [hub|menu]" >&2; exit 2 ;;
+  *) echo "usage: build.sh [hub|menu|bluetooth]" >&2; exit 2 ;;
 esac

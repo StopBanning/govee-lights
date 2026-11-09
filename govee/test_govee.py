@@ -16,17 +16,20 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+import govee_ble
 import govee_lan
 import govee_mcp
 import govee_scenes
 import lights_page
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_ORIGINAL_RUN = govee_ble._run
 # Govee's real Rainbow settings for the H6008, and a made-up block for the H60B2's Aurora.
 RAINBOW_BULB = bytes.fromhex("8301ffebff0f0007ff0000ff7f00ffff0000ff0000ffff0000ff8b00ff")
 TEST_LIBRARY = {
     "H6008": {"Rainbow": {"code": 1175, "param": base64.b64encode(RAINBOW_BULB).decode(), "category": "Natural"},
               "Fire": {"code": 1176, "param": "", "category": "Natural"}},
+    "H617A": {"Aurora": {"code": 13898, "param": base64.b64encode(bytes(range(30))).decode(), "category": "Natural"}},
     "H60B2": {"Rainbow": {"code": 22, "param": "", "category": "Natural"},
               "Aurora": {"code": 13898, "param": base64.b64encode(bytes(range(30))).decode(), "category": "Natural"}},
 }
@@ -104,6 +107,9 @@ class Base(unittest.TestCase):
         patch(self, govee_scenes, "library", lambda sku: TEST_LIBRARY[sku])
         patch(self, govee_scenes, "_http_json", mock.Mock(side_effect=AssertionError("tried to reach Govee")))
         patch(self, govee_mcp, "HUB", "")
+        patch(self, govee_ble, "available", lambda: False)  # never the real Bluetooth app or lights
+        patch(self, govee_ble, "_run", mock.Mock(side_effect=AssertionError("tried to use real Bluetooth")))
+        patch(self, govee_ble, "_states", {})
         env = mock.patch.dict(os.environ, {"GOVEE_API_KEY": ""})  # a key in the shell must not leak in
         env.start()
         self.addCleanup(env.stop)
@@ -532,6 +538,109 @@ class Detection(Base):
         self.assertEqual([item["device"] for item in govee_scenes.account_devices()], ["AA:01", "AA:02"])
         self.assertEqual([item["device"] for item in govee_scenes.account_devices()], ["AA:01", "AA:02"])
         self.assertEqual(cloud.call_count, 1)  # cached
+
+
+class Bluetooth(Base):
+    """Bluetooth-only lights, through a stand-in for the Govee Bluetooth app."""
+
+    registry = {"04:CB:5C:E7:53:6C:EA:44": {"ip": "10.0.0.5", "sku": "H6008"},
+                "40EBDD3C-6650-1DE7-6F17-E9B5EE13C871": {"sku": "H617A", "bluetooth": True}}
+    STRIP = "40EBDD3C-6650-1DE7-6F17-E9B5EE13C871"
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []  # (device, [hex packets], read)
+        self.reply = {"onOff": 1, "brightness": 40}
+
+        def fake_send(device, data, read=False):
+            self.sent.append((device, [p.hex() for p in data], read))
+            return dict(self.reply) if read else {}
+        patch(self, govee_ble, "send", fake_send)
+
+    def test_packets_match_what_the_strip_took(self):  # the bytes an H617A accepted on 2026-11-09
+        self.assertEqual(govee_ble.packet(0x33, 0x01, 0x00).hex(), "3301" + "00" * 17 + "32")
+        self.assertEqual(govee_ble.packet(0xAA, 0x01).hex(), "aa01" + "00" * 17 + "ab")
+        self.assertEqual([p.hex()[:8] for p in govee_ble.packets({"power": True, "rgb": (255, 0, 0), "brightness": 40})],
+                         ["33010100", "33051501", "33042800"])
+        color = govee_ble.packets({"power": True, "rgb": (1, 2, 3)})[1]
+        self.assertEqual(color[:14], bytes([0x33, 0x05, 0x15, 0x01, 1, 2, 3, 0, 0, 0, 0, 0, 0xFF, 0x7F]))
+        self.assertEqual(len(color), 20)
+        self.assertEqual(govee_ble.packets({"power": False}), [govee_ble.packet(0x33, 0x01, 0x00)])
+        warm, cool = govee_ble.kelvin_rgb(2700), govee_ble.kelvin_rgb(6500)
+        self.assertGreater(warm[0] - warm[2], cool[0] - cool[2])
+
+    def test_names(self):
+        self.assertEqual(govee_ble.parse_name("Govee_H617A_0A45"), ("H617A", "0A45"))
+        self.assertEqual(govee_ble.parse_name("GVH6008EA45"), ("H6008", "EA45"))
+        self.assertEqual(govee_ble.parse_name("ihoment_H6182_ab12"), ("H6182", "AB12"))
+        for other in ("Someone's iPhone", "[TV] Living Room", "Govee_", ""):
+            self.assertIsNone(govee_ble.parse_name(other))
+
+    def test_replies(self):
+        self.assertEqual(govee_ble.parse_state(["aa010100000000000000000000000000000000aa",
+                                                "aa04280000000000000000000000000000000086", "3301" + "00" * 18, "zz"]),
+                         {"onOff": 1, "brightness": 40})
+
+    def test_run_reads_the_apps_file(self):
+        patch(self, govee_ble, "available", lambda: True)
+        patch(self, govee_ble, "_run", _ORIGINAL_RUN)  # the real one, with `open` faked below
+
+        def fake_open(command, **kwargs):
+            out = command[command.index("--out") + 1]
+            with open(out, "w") as f:
+                f.write(self.app_output)
+        patch(self, govee_ble.subprocess, "run", fake_open)
+        self.app_output = '{"id": "X1", "name": "Govee_H617A_0A45", "rssi": -30}\n{"id": "X2", "name": "phone"}\nexit 0\n'
+        self.assertEqual(govee_ble.scan(1), [{"id": "X1", "name": "Govee_H617A_0A45", "rssi": -30, "sku": "H617A",
+                                              "suffix": "0A45"}])
+        self.app_output = "error couldn't connect: busy. Is the Govee app connected to it?\nexit 5\n"
+        with self.assertRaisesRegex(govee_ble.BluetoothError, "Govee app connected"):
+            govee_ble.scan(1)
+
+    def test_wifi_lights_heard_over_bluetooth_are_skipped(self):
+        registry = {"04:CB:5C:E7:53:6C:EA:44": {"ip": "10.0.0.5", "sku": "H6008"},
+                    "1A:B3:E8:6E:81:06:7B:57": {"ip": "10.0.0.6", "sku": "H60B2"}}
+        heard = [{"id": "B1", "name": "GVH6008EA45", "sku": "H6008", "suffix": "EA45"},
+                 {"id": "B2", "name": "Govee_H60B2_7B57", "sku": "H60B2", "suffix": "7B57"},
+                 {"id": "B3", "name": "Govee_H617A_0A45", "sku": "H617A", "suffix": "0A45"},
+                 {"id": "B4", "name": "GVH6008EA45", "sku": "H6008", "suffix": "1234"}]
+        self.assertTrue(govee_lan._add_bluetooth_lights(registry, heard))
+        self.assertEqual(sorted(d for d, e in registry.items() if e.get("bluetooth")), ["B3", "B4"])
+        self.assertFalse(govee_lan._add_bluetooth_lights(registry, heard))
+
+    def test_listed_with_the_rest(self):
+        lights = govee_lan.known_lights()
+        strip = next(light for light in lights if light.bluetooth)
+        self.assertEqual((strip.label, govee_lan.where(strip)), ("strip 1", "over Bluetooth"))
+        self.assertEqual(govee_lan.describe({"onOff": 1, "brightness": 40}), "on, 40%")
+        self.assertEqual(govee_lan.resolve("strips", lights), [strip])
+
+    def test_set_over_bluetooth(self):
+        text = govee_lan.set_lights("strip 1", color="blue", brightness=40)
+        self.assertEqual(text, "On, color #0000ff, 40% for 1 light: 1 confirmed.")
+        device, packets, read = self.sent[-1]
+        self.assertEqual((device, read), (self.STRIP, True))
+        self.assertEqual([p[:8] for p in packets], ["33010100", "33051501", "33042800"])
+
+    def test_bluetooth_light_that_does_not_take_it(self):
+        self.reply = {"onOff": 0}
+        text = govee_lan.set_lights("strip 1", power="on")
+        self.assertIn("Not confirmed: strip 1 reports off", text)
+        self.assertEqual(len(self.sent), 2)  # tried twice
+
+    def test_unreachable_bluetooth_light(self):
+        def busy(device, data, read=False):
+            raise govee_ble.BluetoothError("the light wasn't found")
+        patch(self, govee_ble, "send", busy)
+        self.assertIn("strip 1 didn't answer", govee_lan.set_lights("strip 1", power="off"))
+
+    def test_scene_over_bluetooth(self):
+        reply = govee_scenes.start_scene("strip 1", "aurora")
+        self.assertEqual(reply["failed"], [])
+        device, packets, _read = self.sent[-1]
+        self.assertEqual(device, self.STRIP)
+        self.assertEqual(packets, [p.hex() for p in govee_scenes.lan_packets(13898, TEST_LIBRARY["H617A"]["Aurora"]["param"])])
+        self.assertNotIn("strips", govee_scenes.scene_lists("strip 1")["need_key"])
 
 
 class Mcp(unittest.TestCase):

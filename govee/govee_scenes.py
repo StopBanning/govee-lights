@@ -21,6 +21,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import govee_ble
 import govee_lan
 from govee_lan import GoveeError
 
@@ -234,7 +235,7 @@ def scene_lists(target="all") -> dict:
             for name, scene in scenes.items():
                 by_category.setdefault(scene.get("category") or "Other", []).append(name)
             categories[group] = [{"name": category, "scenes": names} for category, names in by_category.items()]
-        if light.sku not in LAN_SCENE_MODELS:
+        if light.sku not in LAN_SCENE_MODELS and not light.bluetooth:
             need_key.add(group)
     common = sorted(set.intersection(*(set(names) for names in kinds.values())), key=str.lower) if kinds else []
     return {"common": common, "kinds": kinds, "categories": categories, "need_key": sorted(need_key),
@@ -298,12 +299,14 @@ def start_scene(target="all", name="") -> dict:
     def start(plan):
         light, scene = plan
         try:
-            if light.sku in LAN_SCENE_MODELS:
+            if light.bluetooth:  # the same packets ptReal carries, written straight to the light
+                govee_ble.send(light.device, lan_packets(scene["code"], scene["param"]))
+            elif light.sku in LAN_SCENE_MODELS:
                 lan_start(light, scene)
             else:
                 cloud_start(light, title)
             return light, None
-        except GoveeError as e:
+        except (GoveeError, govee_ble.BluetoothError) as e:
             return light, str(e)
 
     with ThreadPoolExecutor(max_workers=8) as pool:

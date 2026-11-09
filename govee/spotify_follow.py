@@ -108,7 +108,8 @@ def pixels(image: bytes, run=subprocess.run) -> list[tuple[int, int, int]]:
 
 
 def palette(pixels: list[tuple[int, int, int]], count: int = 4) -> list[tuple[int, int, int]]:
-    """Up to `count` vivid, distinct colors, the most present first, at full brightness for the lights."""
+    """Up to `count` vivid, distinct colors, the most present first, at full brightness and saturation for the
+    lights (the art's hues, not its pastels)."""
     buckets: dict[int, list] = {}
     for r, g, b in pixels:
         if max(r, g, b) < 40 or min(r, g, b) > 215:
@@ -123,10 +124,11 @@ def palette(pixels: list[tuple[int, int, int]], count: int = 4) -> list[tuple[in
     for px in ranked:
         mean = [sum(p[i] for p in px) / len(px) for i in range(3)]
         hue = colorsys.rgb_to_hsv(*(c / 255 for c in mean))[0] * 360
+        s_mean = sum(p[3] for p in px) / len(px)
         if any(min(abs(hue - other), 360 - abs(hue - other)) < 30 for other in hues):
             continue
-        top = max(mean) or 1
-        chosen.append(tuple(min(255, round(c * 255 / top)) for c in mean))
+        # Full brightness and nearly full saturation: a pastel from the art reads as plain white on a bulb.
+        chosen.append(tuple(round(c * 255) for c in colorsys.hsv_to_rgb(hue / 360, 0.9 + 0.1 * min(1.0, s_mean), 1.0)))
         hues.append(hue)
         if len(chosen) == count:
             break

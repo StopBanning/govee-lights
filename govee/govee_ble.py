@@ -151,6 +151,12 @@ def apply(device: str, change: dict) -> dict:
     return send(device, packets(change), read=True)
 
 
+def last_state(device: str) -> dict:
+    """The last power and brightness read from the light, however old, without connecting; {} if none."""
+    seen = _states.get(device)
+    return dict(seen[1]) if seen else {}
+
+
 def state(device: str) -> dict:
     """The light's power and brightness: a recent reading if there is one, else a fresh one; {} if it can't be
     reached."""

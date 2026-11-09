@@ -22,6 +22,7 @@ from urllib.parse import parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import govee_ble  # noqa: E402
 import govee_lan  # noqa: E402
 import govee_mcp  # noqa: E402
 import govee_scenes  # noqa: E402
@@ -92,6 +93,7 @@ class Follower:
         self.problem = spotify_follow.last_problem if playing is None else ""
         if not playing or playing["state"] != "playing" or playing["id"] == self.last_id:
             return False
+        started = time.monotonic()
         self.last_id, self.problem = playing["id"], ""
         self.track = {key: playing[key] for key in ("name", "artist", "id")}
         try:
@@ -104,7 +106,10 @@ class Follower:
             if not self.enabled:  # switched off while the art was loading
                 return False
             lights = govee_lan.known_lights()
-            states = govee_lan.status(lights)
+            states = govee_lan.status([light for light in lights if not light.bluetooth])
+            # A Bluetooth light would take seconds to ask, so its last reading stands in; never read counts as on.
+            states.update({light.device: govee_ble.last_state(light.device) or {"onOff": 1}
+                           for light in lights if light.bluetooth})
             lit = [light for light in lights if states.get(light.device, {}).get("onOff") == 1]  # off stays off
             if not lit:
                 return False
@@ -112,15 +117,33 @@ class Follower:
             groups: dict[tuple, list] = {}
             for device, color in plan.items():
                 groups.setdefault(color, []).append(device)
-            missed = []
+            by_device = {light.device: light for light in lit}
+            missed: list = []
+
+            def paint(color, devices):
+                missed.extend(govee_lan.set_lights_result(",".join(devices), color=spotify_follow.hex_color(color))
+                              ["failed"])
+
+            # Bluetooth lights take seconds each, so they go alongside the network ones instead of after them.
+            # Network groups stay one at a time: their replies all come back on the same UDP port.
+            slow = [threading.Thread(target=paint, args=(color, [device]), daemon=True)
+                    for color, devices in groups.items() for device in devices if by_device[device].bluetooth]
+            for thread in slow:
+                thread.start()
             for color, devices in groups.items():
-                result = govee_lan.set_lights_result(",".join(devices), color=spotify_follow.hex_color(color))
-                missed += result["failed"]
-        print(f"Spotify: {self.track['name']} by {self.track['artist']} -> {', '.join(self.colors)}"
-              + (f"; missed {', '.join(missed)}" if missed else ""), file=sys.stderr, flush=True)
+                network = [device for device in devices if not by_device[device].bluetooth]
+                if network:
+                    paint(color, network)
+            network_done = time.monotonic() - started
+            for thread in slow:
+                thread.join(timeout=30)
+        print(f"Spotify: {self.track['name']} by {self.track['artist']} -> {', '.join(self.colors)} "
+              f"in {network_done:.1f} s (network), {time.monotonic() - started:.1f} s (all)"
+              + (f"; missed {', '.join(missed)}" if missed else ""),
+              file=sys.stderr, flush=True)
         return True
 
-    def run(self, every: float = 3.0) -> None:
+    def run(self, every: float = 1.5) -> None:
         while True:
             try:
                 self.tick()

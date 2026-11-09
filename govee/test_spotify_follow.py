@@ -114,7 +114,12 @@ class Palette(unittest.TestCase):
     def test_drops_black_white_grey_and_ranks(self):
         px = [(0, 0, 0)] * 50 + [(255, 255, 255)] * 50 + [(128, 128, 128)] * 50 + \
              [(200, 30, 30)] * 20 + [(30, 30, 200)] * 10 + [(30, 200, 30)] * 5
-        self.assertEqual(sf.palette(px), [(255, 38, 38), (38, 38, 255), (38, 255, 38)])
+        self.assertEqual(sf.palette(px), [(255, 4, 4), (4, 4, 255), (4, 255, 4)])
+
+    def test_pastels_come_out_vivid(self):  # a pale peach and a pale blue read as white on a bulb
+        for r, g, b in sf.palette([(255, 200, 178)] * 10 + [(178, 231, 255)] * 8):
+            self.assertLess(min(r, g, b), 30)
+            self.assertEqual(max(r, g, b), 255)
 
     def test_near_hues_count_once(self):
         px = [(255, 0, 0)] * 20 + [(255, 40, 0)] * 15 + [(0, 0, 255)] * 5

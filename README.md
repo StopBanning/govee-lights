@@ -62,7 +62,7 @@ with each song. Switch it with **Follow Spotify** in the menu bar, the card on t
 `follow_spotify`. Picking any other color, scene or preset turns it off, so they don't fight. Paused, ads, podcasts
 and lights that are off are left alone. The switch survives restarts.
 
-- No Spotify developer key: the hub asks the Spotify app over AppleScript every 3 seconds and acts once per song.
+- No Spotify developer key: the hub asks the Spotify app over AppleScript every 1.5 seconds and acts once per song.
   The first time, macOS asks whether **Lights Hub** may control Spotify: click OK. If you clicked Don't Allow,
   it's in System Settings > Privacy & Security > Automation.
 - Colors: the artwork (from Spotify's image CDN) is shrunk to 24x24 with macOS's `sips`, then the most present

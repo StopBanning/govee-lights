@@ -680,15 +680,15 @@ class FollowSpotify(Base):
         self.light.state["onOff"] = 1
         self.post("/api/spotify", {"enabled": True})
         self.assertTrue(self.follower.tick())
-        self.assertEqual(self.sets, [("FAKE", "#1414ff")])  # a bulb takes the second color, at full brightness
-        self.assertEqual(self.light.state["color"], {"r": 20, "g": 20, "b": 255})
+        self.assertEqual(self.sets, [("FAKE", "#0202ff")])  # a bulb takes the second color, vivid
+        self.assertEqual(self.light.state["color"], {"r": 2, "g": 2, "b": 255})
         self.assertFalse(self.follower.tick())  # same song: nothing
         self.song["id"] = "spotify:track:2"
         self.assertTrue(self.follower.tick())
         self.assertEqual(len(self.sets), 2)
         status = json.loads(self.get("/api/spotify")[2])
         self.assertEqual((status["enabled"], status["track"]["name"], status["colors"]),
-                         (True, "Song", ["#ff1414", "#1414ff"]))
+                         (True, "Song", ["#ff0202", "#0202ff"]))
 
     def test_lights_that_are_off_stay_off(self):
         self.light.state["onOff"] = 0

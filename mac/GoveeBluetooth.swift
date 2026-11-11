@@ -233,14 +233,21 @@ final class Server: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     // A thread accepts connections; each request is handled on the main queue, one at a time.
     func listen() {
-        unlink(path)
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8.prefix(MemoryLayout.size(ofValue: address.sun_path) - 1))
         withUnsafeMutableBytes(of: &address.sun_path) { buffer in
             buffer.copyBytes(from: bytes)
         }
+        // Another copy already serving? Then this one leaves: two would fight over the same lights.
+        let probe = socket(AF_UNIX, SOCK_STREAM, 0)
+        let alive = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(probe, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        close(probe)
+        if alive == 0 { exit(0) }
+        unlink(path)
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }

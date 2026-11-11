@@ -12,8 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        python: ["3.9", "3.13"]
+        # GitHub's current Ubuntu no longer offers 3.9; the Mac's own /usr/bin/python3 (3.9) is tested locally.
+        python: ["3.12", "3.x"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

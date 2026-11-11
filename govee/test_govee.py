@@ -740,6 +740,34 @@ class FollowSpotify(Base):
         self.assertFalse(self.follower.enabled)
 
 
+class SlowAndMovedLights(Base):
+    registry = ONE_FAKE_LIGHT
+
+    def test_a_slow_light_gets_more_tries(self):
+        light = self.start_light(mute=True)
+        threading.Timer(0.9, lambda: setattr(light, "mute", False)).start()  # answers only after the first round
+        self.assertEqual(govee_lan.status(govee_lan.known_lights())["FAKE"]["onOff"], 0)
+
+    def test_a_light_that_moved_is_found_again(self):
+        self.start_light()
+        registry = {"FAKE": {"sku": "H6008", "ip": "127.0.0.9"}}  # an old address: nothing answers there
+        with open(govee_lan.LIGHTS_FILE, "w") as f:
+            json.dump(registry, f)
+        self.scan.return_value = [govee_lan.Light("FAKE", "H6008", "127.0.0.1")]
+        states = govee_lan.status(govee_lan.known_lights(), waits=(0.2,))
+        self.assertIn("FAKE", states)
+        self.assertEqual(self.scan.call_count, 1)
+
+    def test_doctor(self):
+        self.start_light()
+        self.scan.return_value = [govee_lan.Light("FAKE", "H6008", "127.0.0.1")]
+        patch(self, govee_lan, "local_addresses", lambda: ["192.168.1.23"])
+        report = govee_lan.doctor(seconds=0.1)
+        self.assertIn("Scan (0 s): 1 answered", report)
+        self.assertIn("State of H6008 at 127.0.0.1: answered in", report)
+        self.assertIn('"onOff": 0', report)
+
+
 class Mcp(unittest.TestCase):
     def setUp(self):
         patch(self, govee_mcp, "HUB", "")

@@ -208,9 +208,13 @@ def scan(timeout: float = 1.5, expect: int = 0) -> list[Light]:
     return list(found.values())
 
 
-def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
+STATUS_WAITS = (0.6, 0.8, 1.1)  # seconds per round: fast networks finish in the first; slow Wi-Fi gets three tries
+
+
+def status(lights: list[Light], waits=None, rescan_if_silent: bool = True) -> dict[str, dict]:
     """Ask lights for their state. Returns {device ID: state} for the ones that answered. Bluetooth lights report
-    power and brightness only."""
+    power and brightness only. If no network light answers at all, their addresses may have changed (DHCP), so
+    it scans once and asks again (apply() does its own rescan, so it turns this off)."""
     states: dict[str, dict] = {}
     for light in lights:
         if light.bluetooth:
@@ -222,11 +226,11 @@ def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
         return states
     ask = _packet("devStatus", {})
     with _listener(0.1) as s:
-        for _round in range(2):
+        for wait in waits or STATUS_WAITS:
             for ip, light in by_ip.items():
                 if light.device not in states:
                     _sendto(s, ask, (ip, CONTROL_PORT))
-            end = time.monotonic() + timeout / 2
+            end = time.monotonic() + wait
             while time.monotonic() < end and not all(light.device in states for light in by_ip.values()):
                 try:
                     data, (ip, _port) = s.recvfrom(4096)
@@ -237,6 +241,10 @@ def status(lights: list[Light], timeout: float = 1.0) -> dict[str, dict]:
                     states[by_ip[ip].device] = msg.get("data") or {}
             if all(light.device in states for light in by_ip.values()):
                 break
+    if rescan_if_silent and not any(light.device in states for light in by_ip.values()):
+        moved = _refresh_addresses(list(by_ip.values()))
+        if any(new.ip != old.ip for new, old in zip(moved, by_ip.values())):
+            states.update(status(moved, waits, rescan_if_silent=False))
     return states
 
 
@@ -331,7 +339,7 @@ def apply(lights: list[Light], change: dict) -> list[tuple[Light, dict]]:
     pending, refreshed = list(lights), False
     for attempt, wait in enumerate((0.3, 0.6, 1.0)):
         time.sleep(wait)
-        heard = status(pending)
+        heard = status(pending, rescan_if_silent=False)
         pending = [light for light in pending if not matches(heard.get(light.device, {}), change)]
         if not pending or attempt == 2:
             break
@@ -688,10 +696,66 @@ def name_light(target: str, name: str, room: str = "") -> str:
     return f'{light.label} is now called "{name}"' + (f" (room: {room})" if room else "") + "."
 
 
+def doctor(seconds: float = 3.0) -> str:
+    """A report for when lights aren't found or don't answer: what this Mac sees, step by step. Changes nothing."""
+    lines = [f"Python {sys.version.split()[0]} on {sys.platform}; data folder {DATA_DIR}"]
+    known = _read_registry()
+    lines.append(f"Lights remembered: {len(known)}" + "".join(
+        f"\n  {entry.get('sku', '?')} {'over Bluetooth' if entry.get('bluetooth') else 'at ' + str(entry.get('ip'))}"
+        f" (id {device})" for device, entry in known.items()))
+    lines.append(f"Networks the scan goes out on: {', '.join(local_addresses()) or 'none found (the default one)'}")
+    if manual_addresses():
+        lines.append(f"Asked directly (GOVEE_LIGHT_IPS): {', '.join(manual_addresses())}")
+    try:
+        holders = subprocess.run(["lsof", "-nP", f"-iUDP:{LISTEN_PORT}"], capture_output=True, text=True,
+                                 timeout=5).stdout.strip().splitlines()[1:]
+    except (OSError, subprocess.SubprocessError):
+        holders = []
+    lines.append(f"Other programs on UDP port {LISTEN_PORT}, where lights answer: "
+                 + ("none" if not holders else "\n  " + "\n  ".join(" ".join(h.split()[:2]) for h in holders)
+                    + "\n  If one of them is another Govee tool (Home Assistant, Homebridge, govee2mqtt), quit it:"
+                      " the lights' answers can go to it instead of here."))
+    try:
+        found = scan(timeout=seconds)
+    except GoveeError as e:
+        return "\n".join(lines + [f"Scan failed: {e}"])
+    lines.append(f"Scan ({seconds:.0f} s): {len(found)} answered" + "".join(
+        f"\n  {light.sku} at {light.ip} (id {light.device})" for light in found))
+    if not found:
+        lines.append("  Nothing answered. Check LAN Control in the Govee Home app, that this Mac is on the same "
+                     "Wi-Fi (not a guest network), and System Settings > Privacy & Security > Local Network.")
+    for light in found:
+        old = known.get(light.device, {}).get("ip")
+        if old and old != light.ip:
+            lines.append(f"  {light.device} moved from {old} to {light.ip}: the next list will update it.")
+    ask = _packet("devStatus", {})
+    with _listener(0.2) as s:
+        for light in found:
+            started, reply = time.monotonic(), None
+            _sendto(s, ask, (light.ip, CONTROL_PORT))
+            while time.monotonic() - started < 3 and reply is None:
+                try:
+                    data, (ip, _port) = s.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                msg = _parse(data)
+                if msg.get("cmd") == "devStatus":
+                    reply = (ip, msg.get("data"), time.monotonic() - started)
+            if reply is None:
+                lines.append(f"State of {light.sku} at {light.ip}: no answer in 3 s")
+            else:
+                ip, data, took = reply
+                where = "" if ip == light.ip else f" BUT FROM {ip}, not {light.ip}"
+                lines.append(f"State of {light.sku} at {light.ip}: answered in {took:.2f} s{where}: {json.dumps(data)}")
+    lines.append("Paste this to whoever is helping. It has your lights' IDs and home addresses, nothing else.")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Control Govee lights on the home network.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="scan for lights and show their state")
+    sub.add_parser("doctor", help="when lights aren't found or show as off: report what this Mac sees")
     p = sub.add_parser("set", help="change lights")
     p.add_argument("target", nargs="?", default="all",
                    help='"all" (the default), a name, a room, "bulbs" or "floor lamps"; commas for several')
@@ -709,6 +773,8 @@ def main(argv=None) -> int:
     try:
         if args.command == "list":
             print(list_lights())
+        elif args.command == "doctor":
+            print(doctor())
         elif args.command == "set":
             print(set_lights(args.target, args.power, args.brightness, args.color, args.temperature))
         elif args.command == "blink":

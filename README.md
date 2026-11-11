@@ -35,6 +35,9 @@ Targets: `all` (default), a name, a room, a kind (`bulbs`, `strips`, `floor lamp
 - If your router blocks multicast (some mesh systems and guest networks do), list the lights' IPs:
   `GOVEE_LIGHT_IPS="192.168.1.20,192.168.1.21"`.
 - Bluetooth-only lights are found too, on a Mac (see below).
+- Lights found but shown as off, or not found at all? Run `python3 govee/govee_lan.py doctor`. It changes
+  nothing and reports each step: the networks, other programs on the lights' port, what answered the scan, and
+  how each light answers when asked its state.
 - With a Govee API key set (see Scenes), `list` names unnamed lights after the names in the Govee Home app, and
   lists any light in your account that didn't answer, which usually means LAN Control is off for it.
 

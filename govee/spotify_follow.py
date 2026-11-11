@@ -152,5 +152,13 @@ def assign(lights, colors: list[tuple]) -> dict[str, tuple]:
     return plan
 
 
+def spread(colors: list[tuple], parts: int) -> list[tuple]:
+    """Colors for the parts of one light: a lamp's few heads cycle through them; a strip's many sections get them
+    in even blocks along its length."""
+    if parts <= 3 or parts <= len(colors):
+        return [colors[i % len(colors)] for i in range(parts)]
+    return [colors[i * len(colors) // parts] for i in range(parts)]
+
+
 def hex_color(rgb: tuple) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)

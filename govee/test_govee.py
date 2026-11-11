@@ -111,6 +111,8 @@ class Base(unittest.TestCase):
         patch(self, govee_ble, "available", lambda: False)  # never the real Bluetooth app or lights
         patch(self, govee_ble, "_run", mock.Mock(side_effect=AssertionError("tried to use real Bluetooth")))
         patch(self, govee_ble, "_states", {})
+        sock = os.path.join(tempfile.mkdtemp(dir="/tmp"), "bt.sock")  # short: Unix socket paths have a length limit
+        patch(self, govee_ble, "_socket_path", lambda: sock)
         self.follower = lights_page.Follower(os.path.join(folder, "follow-spotify.json"))  # never the real switch
         patch(self, lights_page, "FOLLOWER", self.follower)
         patch(self, govee_mcp, "FOLLOWER", self.follower)
@@ -590,6 +592,7 @@ class Bluetooth(Base):
     def test_run_reads_the_apps_file(self):
         patch(self, govee_ble, "available", lambda: True)
         patch(self, govee_ble, "_run", _ORIGINAL_RUN)  # the real one, with `open` faked below
+        patch(self, govee_ble, "_server_lines", lambda args, timeout: None)  # as if the app can't stay running
 
         def fake_open(command, **kwargs):
             out = command[command.index("--out") + 1]
@@ -602,6 +605,26 @@ class Bluetooth(Base):
         self.app_output = "error couldn't connect: busy. Is the Govee app connected to it?\nexit 5\n"
         with self.assertRaisesRegex(govee_ble.BluetoothError, "Govee app connected"):
             govee_ble.scan(1)
+
+    def test_run_through_the_staying_connected_app(self):
+        import socket as socketlib
+        patch(self, govee_ble, "available", lambda: True)
+        patch(self, govee_ble, "_run", _ORIGINAL_RUN)
+        asked = []
+        server = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        server.bind(govee_ble._socket_path())
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def answer():
+            client, _ = server.accept()
+            with client:
+                asked.append(json.loads(client.recv(65536)))
+                client.sendall(json.dumps({"lines": ["aa010100", "exit 0"]}).encode() + b"\n")
+        threading.Thread(target=answer, daemon=True).start()
+        patch(self, govee_ble.subprocess, "run", mock.Mock(side_effect=AssertionError("started a one-shot run")))
+        self.assertEqual(govee_ble._run(["send", "X", "aa01"]), ["aa010100"])
+        self.assertEqual(asked, [{"args": ["send", "X", "aa01"]}])
 
     def test_wifi_lights_heard_over_bluetooth_are_skipped(self):
         registry = {"04:CB:5C:E7:53:6C:EA:44": {"ip": "10.0.0.5", "sku": "H6008"},
@@ -717,6 +740,34 @@ class FollowSpotify(Base):
         self.post("/api/blink", {"target": "bulb 1"})  # blinking isn't a look
         self.assertTrue(self.follower.enabled)
 
+    def test_plain_lights_fade_then_land(self):
+        self.light.state.update(onOff=1, color={"r": 255, "g": 255, "b": 255}, colorTemInKelvin=0)
+        self.follower.set(True)
+        self.assertTrue(self.follower.tick())
+        self.assertGreaterEqual(self.light.commands.count("colorwc"), 5)  # in-between colors, then the last
+        self.assertEqual(self.light.state["color"], {"r": 2, "g": 2, "b": 255})
+
+    def test_a_light_switched_on_mid_song_joins_in(self):
+        self.light.state["onOff"] = 0
+        self.follower.set(True)
+        self.assertFalse(self.follower.tick())  # song starts with the light off
+        self.light.state["onOff"] = 1
+        results = [self.follower.tick() for _ in range(10)]  # the check runs every 10th poll
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(self.light.state["color"], {"r": 2, "g": 2, "b": 255})
+        self.assertFalse(any(self.follower.tick() for _ in range(10)))  # painted once only
+
+    def test_a_lamp_with_heads_gets_a_color_per_head(self):
+        registry = {"FAKE": {"sku": "H60B2", "ip": "127.0.0.1"}}
+        with open(govee_lan.LIGHTS_FILE, "w") as f:
+            json.dump(registry, f)
+        self.light.state["onOff"] = 1
+        self.follower.set(True)
+        self.assertTrue(self.follower.tick())
+        packets = [base64.b64decode(p) for p in self.light.real[-1]]
+        by_mask = {p[12] | p[13] << 8: tuple(p[4:7]) for p in packets}
+        self.assertEqual(by_mask, {0b101: (255, 2, 2), 0b010: (2, 2, 255)})  # heads 1 and 3 main, head 2 next
+
     def test_switch_is_remembered(self):
         self.follower.set(True)
         self.assertTrue(lights_page.Follower(self.follower.path).enabled)
@@ -766,6 +817,21 @@ class SlowAndMovedLights(Base):
         self.assertIn("Scan (0 s): 1 answered", report)
         self.assertIn("State of H6008 at 127.0.0.1: answered in", report)
         self.assertIn('"onOff": 0', report)
+
+
+class Segments(unittest.TestCase):
+    def test_packets_group_segments_by_color(self):
+        red, blue = (255, 0, 0), (0, 0, 255)
+        packets = govee_ble.segment_packets([red, blue, red])
+        self.assertEqual([(p[4:7], p[12], p[13]) for p in packets], [(bytes(red), 0b101, 0), (bytes(blue), 0b010, 0)])
+        self.assertTrue(all(len(p) == 20 for p in packets))
+        self.assertEqual(govee_ble.segment_packets([red] * 15)[0][12:14], bytes([0xFF, 0x7F]))  # all 15
+
+    def test_spread(self):
+        a, b, c = (1, 0, 0), (0, 1, 0), (0, 0, 1)
+        self.assertEqual(spotify_follow.spread([a, b], 3), [a, b, a])
+        self.assertEqual(spotify_follow.spread([a, b, c], 15), [a] * 5 + [b] * 5 + [c] * 5)
+        self.assertEqual(spotify_follow.spread([a], 15), [a] * 15)
 
 
 class Mcp(unittest.TestCase):

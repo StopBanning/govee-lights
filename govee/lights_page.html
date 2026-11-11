@@ -253,7 +253,9 @@ function render(groups) {
   const on = lights.filter((l) => l.state && l.state.onOff === 1);
   const silent = lights.filter((l) => !l.state);
   let summary = lights.length ? `${on.length} of ${lights.length} on` : "No lights found yet";
-  if (silent.length) summary += ` · ${silent.length} not answering`;
+  if (silent.length && silent.length === lights.length) {
+    summary = `None of the ${lights.length} lights answered. They may still be on: on the Mac, run govee/govee_lan.py doctor.`;
+  } else if (silent.length) summary += ` · ${silent.length} not answering`;
   $("#summary").textContent = summary;
 
   // Start the slider at the chosen lights' average brightness.

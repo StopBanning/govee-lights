@@ -360,9 +360,14 @@ final class LightsMenu: NSObject, NSMenuDelegate {
             let on = states.filter { $0?["onOff"] as? Int == 1 }.count
             let silent = states.filter { $0 == nil }.count
             self.lights = lights
-            self.summary = "\(on) of \(lights.count) on" + (silent > 0 ? " · \(silent) not answering" : "")
+            if silent > 0 && silent == lights.count {
+                // Not "0 of 4 on": they may well be on. They just didn't answer.
+                self.summary = "None of the \(lights.count) lights answered. Run: python3 govee/govee_lan.py doctor"
+            } else {
+                self.summary = "\(on) of \(lights.count) on" + (silent > 0 ? " · \(silent) not answering" : "")
+            }
             self.groups = (reply["groups"] as? [String] ?? []).filter { $0 != "all" }
-            self.symbol = on > 0 ? "lightbulb.fill" : "lightbulb"
+            self.symbol = silent > 0 && silent == lights.count ? "lightbulb.slash" : (on > 0 ? "lightbulb.fill" : "lightbulb")
             self.show()
         }
     }

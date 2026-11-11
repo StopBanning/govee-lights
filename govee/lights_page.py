@@ -55,6 +55,9 @@ class Follower:
         self.colors: list[str] = []
         self.problem = ""
         self.last_id = ""
+        self.rgb: list = []  # this song's colors, as RGB
+        self.painted: set = set()  # lights given them already
+        self.checks = 0
         try:
             with open(path) as f:
                 self.enabled = bool(json.load(f).get("enabled"))
@@ -91,8 +94,10 @@ class Follower:
             self.problem = str(e)
             return False
         self.problem = spotify_follow.last_problem if playing is None else ""
-        if not playing or playing["state"] != "playing" or playing["id"] == self.last_id:
+        if not playing or playing["state"] != "playing":
             return False
+        if playing["id"] == self.last_id:
+            return self.check_newly_on()
         started = time.monotonic()
         self.last_id, self.problem = playing["id"], ""
         self.track = {key: playing[key] for key in ("name", "artist", "id")}
@@ -102,6 +107,21 @@ class Follower:
             self.colors = []  # an ad, a podcast, art that won't load: leave the lights alone
             return False
         self.colors = [spotify_follow.hex_color(c) for c in colors]
+        self.rgb, self.painted, self.checks = colors, set(), 0
+        changed = self.paint(started)
+        return changed
+
+    def check_newly_on(self) -> bool:
+        """Mid-song: paint lights that were switched on since the song started. Every few polls, not every one."""
+        self.checks += 1
+        if not self.rgb or self.checks % 10:
+            return False
+        return self.paint(time.monotonic(), only_new=True)
+
+    def paint(self, started: float, only_new: bool = False) -> bool:
+        """Give the lights that are on this song's colors: spread over the parts of lamps and strips, a fade on the
+        rest. True if anything was sent."""
+        colors = self.rgb
         with LOCK:
             if not self.enabled:  # switched off while the art was loading
                 return False
@@ -111,33 +131,56 @@ class Follower:
             states.update({light.device: govee_ble.last_state(light.device) or {"onOff": 1}
                            for light in lights if light.bluetooth})
             lit = [light for light in lights if states.get(light.device, {}).get("onOff") == 1]  # off stays off
-            if not lit:
+            todo = [light for light in lit if light.device not in self.painted] if only_new else lit
+            if not todo:
                 return False
-            plan = spotify_follow.assign(lit, colors)
-            groups: dict[tuple, list] = {}
-            for device, color in plan.items():
-                groups.setdefault(color, []).append(device)
-            by_device = {light.device: light for light in lit}
+            plan = spotify_follow.assign(lit, colors)  # over every lit light, so newcomers fit the same pattern
             missed: list = []
+            segmented = [light for light in todo if govee_lan.SEGMENTS.get(light.sku, 0) > 1]
+            whole = [light for light in todo if light not in segmented]
 
-            def paint(color, devices):
-                missed.extend(govee_lan.set_lights_result(",".join(devices), color=spotify_follow.hex_color(color))
-                              ["failed"])
+            def parts_colors(light):
+                # The light's own color first, then the others, so its main color matches the one-color plan.
+                own = plan[light.device]
+                ordered = [own] + [c for c in colors if c != own]
+                return spotify_follow.spread(ordered, govee_lan.SEGMENTS[light.sku])
+
+            def paint_slow(light):
+                try:
+                    if light in segmented:
+                        govee_lan.send_segments(light, parts_colors(light))
+                    else:
+                        missed.extend(govee_lan.set_lights_result(
+                            light.device, color=spotify_follow.hex_color(plan[light.device]))["failed"])
+                except govee_lan.GoveeError:
+                    missed.append(light.label)
 
             # Bluetooth lights take seconds each, so they go alongside the network ones instead of after them.
             # Network groups stay one at a time: their replies all come back on the same UDP port.
-            slow = [threading.Thread(target=paint, args=(color, [device]), daemon=True)
-                    for color, devices in groups.items() for device in devices if by_device[device].bluetooth]
+            slow = [threading.Thread(target=paint_slow, args=(light,), daemon=True) for light in todo if light.bluetooth]
             for thread in slow:
                 thread.start()
+            for light in segmented:
+                if not light.bluetooth:
+                    try:
+                        govee_lan.send_segments(light, parts_colors(light))
+                    except govee_lan.GoveeError:
+                        missed.append(light.label)
+            network = [light for light in whole if not light.bluetooth]
+            govee_lan.fade([(light, govee_lan.shown_rgb(states.get(light.device, {})), plan[light.device])
+                            for light in network])
+            groups: dict[tuple, list] = {}
+            for light in network:
+                groups.setdefault(plan[light.device], []).append(light.device)
             for color, devices in groups.items():
-                network = [device for device in devices if not by_device[device].bluetooth]
-                if network:
-                    paint(color, network)
+                missed.extend(govee_lan.set_lights_result(",".join(devices), color=spotify_follow.hex_color(color))
+                              ["failed"])
             network_done = time.monotonic() - started
             for thread in slow:
                 thread.join(timeout=30)
-        print(f"Spotify: {self.track['name']} by {self.track['artist']} -> {', '.join(self.colors)} "
+            self.painted |= {light.device for light in todo}
+        what = f"{len(todo)} newly on" if only_new else ", ".join(self.colors)
+        print(f"Spotify: {self.track['name']} by {self.track['artist']} -> {what} "
               f"in {network_done:.1f} s (network), {time.monotonic() - started:.1f} s (all)"
               + (f"; missed {', '.join(missed)}" if missed else ""),
               file=sys.stderr, flush=True)

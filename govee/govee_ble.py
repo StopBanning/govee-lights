@@ -79,6 +79,16 @@ def packets(change: dict) -> list[bytes]:
     return out
 
 
+def segment_packets(colors: list) -> list[bytes]:
+    """One color per segment (section of a strip, head of a lamp), as few packets as possible: segments that share
+    a color go in one packet, picked out by a bit mask (bit 0 = the first segment, 15 bits)."""
+    masks: dict[tuple, int] = {}
+    for index, color in enumerate(colors[:15]):
+        masks[tuple(color)] = masks.get(tuple(color), 0) | (1 << index)
+    return [packet(0x33, 0x05, 0x15, 0x01, r, g, b, 0, 0, 0, 0, 0, mask & 0xFF, mask >> 8)
+            for (r, g, b), mask in masks.items()]
+
+
 ASK = [packet(0xAA, 0x01), packet(0xAA, 0x04)]
 
 
@@ -97,11 +107,66 @@ def parse_state(lines: list[str]) -> dict:
     return state
 
 
+def _socket_path() -> str:
+    """Where the Bluetooth app listens while it stays running (Unix socket paths must be short)."""
+    import govee_lan  # here, not at the top: govee_lan imports this module
+    path = os.path.join(govee_lan.DATA_DIR, "bluetooth.sock")
+    return path if len(path) < 100 else os.path.join(tempfile.gettempdir(), f"govee-lights-{os.getuid()}.sock")
+
+
+def _ask_server(args: list[str], timeout: float) -> list[str] | None:
+    """Send a command to the running Bluetooth app; None if it isn't running."""
+    import json
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(_socket_path())
+            s.sendall(json.dumps({"args": args}).encode() + b"\n")
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        return [str(line) for line in json.loads(data).get("lines", [])]
+    except (OSError, ValueError):
+        return None
+
+
+def _server_lines(args: list[str], timeout: float) -> list[str] | None:
+    """The command's output from the staying-connected Bluetooth app, starting it if it isn't running."""
+    lines = _ask_server(args, timeout)
+    if lines is not None:
+        return lines
+    subprocess.run(["open", "-g", "-n", APP, "--args", "serve", _socket_path()], capture_output=True, check=False,
+                   timeout=10)
+    for _ in range(30):  # it takes a moment to start listening
+        time.sleep(0.1)
+        if os.path.exists(_socket_path()):
+            lines = _ask_server(args, timeout)
+            if lines is not None:
+                return lines
+    return None
+
+
 def _run(args: list[str], timeout: float = 25) -> list[str]:
-    """Run the Bluetooth app and return its output lines. `open` can't pass output or an exit code back, so the app
-    writes both to a file."""
+    """Run a Bluetooth app command and return its output lines. Through the app staying connected when possible
+    (a fraction of a second); otherwise as a one-shot run, whose output comes back in a file because `open` can't
+    pass output or an exit code back."""
     if not available():
         raise BluetoothError("Bluetooth lights need the Govee Bluetooth app: run mac/build.sh")
+    lines = _server_lines(args, timeout)
+    if lines is None:
+        lines = _one_shot(args, timeout)
+    code = next((line.split(" ", 1)[1] for line in reversed(lines) if line.startswith("exit ")), "?")
+    if code != "0":
+        problem = next((line[6:] for line in lines if line.startswith("error ")), f"it stopped with code {code}")
+        raise BluetoothError(problem)
+    return [line for line in lines if not line.startswith(("exit ", "error "))]
+
+
+def _one_shot(args: list[str], timeout: float) -> list[str]:
     with tempfile.TemporaryDirectory() as folder:
         out = os.path.join(folder, "out.txt")
         try:
@@ -114,11 +179,7 @@ def _run(args: list[str], timeout: float = 25) -> list[str]:
                 lines = [line.strip() for line in f if line.strip()]
         except OSError:
             raise BluetoothError("the Govee Bluetooth app didn't start") from None
-    code = next((line.split(" ", 1)[1] for line in reversed(lines) if line.startswith("exit ")), "?")
-    if code != "0":
-        problem = next((line[6:] for line in lines if line.startswith("error ")), f"it stopped with code {code}")
-        raise BluetoothError(problem)
-    return [line for line in lines if not line.startswith(("exit ", "error "))]
+    return lines
 
 
 def scan(seconds: float = 3) -> list[dict]:

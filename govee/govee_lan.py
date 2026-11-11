@@ -12,6 +12,7 @@ Run `python3 govee_lan.py --help` for the command line, or use govee_mcp.py as a
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -59,6 +60,8 @@ KINDS = {
     "H70B1": "curtain light",
 }
 MODEL_FAMILIES = {"H61": "strip", "H70": "outdoor light"}  # by the start of the model number; add yours
+# Models whose parts take their own colors, and how many parts: the tree lamp's heads, a strip's sections.
+SEGMENTS = {"H60B2": 3, "H617A": 15}
 TEMPERATURES = {"warm": 2700, "soft": 3000, "neutral": 4000, "cool": 5500, "daylight": 6500}
 WHITES = {"white": 4000, "warm white": 2700, "soft white": 3000, "cool white": 5500}
 COLORS = {
@@ -299,6 +302,49 @@ def matches(state: dict, change: dict) -> bool:
         if state.get("colorTemInKelvin") or any(abs(color.get(k, -999) - v) > 10 for k, v in zip("rgb", change["rgb"])):
             return False
     return True
+
+
+def send_segments(light: Light, colors: list) -> None:
+    """One color per segment of a light (see SEGMENTS). Over Bluetooth, or over the LAN wrapped in Govee's ptReal
+    command. Lights don't report segment colors, so this can't be confirmed."""
+    packets = govee_ble.segment_packets(colors)
+    if light.bluetooth:
+        try:
+            govee_ble.send(light.device, packets)
+        except govee_ble.BluetoothError as e:
+            raise GoveeError(f"{light.label}: {e}") from None
+        return
+    message = _packet("ptReal", {"command": [base64.b64encode(p).decode() for p in packets]})
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        for _ in range(2):  # can't be confirmed, so say it twice in case one is dropped
+            _sendto(s, message, (light.ip, CONTROL_PORT))
+            time.sleep(0.05)
+
+
+def fade(steps: list, seconds: float = 0.8, count: int = 6) -> None:
+    """Glide network lights from one color to another: steps is [(light, from_rgb, to_rgb)]. Sends the in-between
+    colors only; the caller sends (and confirms) the last one."""
+    lights = [(light, a, b) for light, a, b in steps if not light.bluetooth and a and tuple(a) != tuple(b)]
+    if not lights:
+        return
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        for step in range(1, count):
+            t = step / count
+            for light, a, b in lights:
+                r, g, bl = (round(x + (y - x) * t) for x, y in zip(a, b))
+                _sendto(s, _packet("colorwc", {"color": {"r": r, "g": g, "b": bl}, "colorTemInKelvin": 0}),
+                        (light.ip, CONTROL_PORT))
+            time.sleep(seconds / count)
+
+
+def shown_rgb(state: dict):
+    """The color a light reports showing, as RGB (whites approximated), or None."""
+    if not state or state.get("onOff") != 1:
+        return None
+    if state.get("colorTemInKelvin"):
+        return govee_ble.kelvin_rgb(int(state["colorTemInKelvin"]))
+    color = state.get("color")
+    return (color.get("r", 0), color.get("g", 0), color.get("b", 0)) if color else None
 
 
 def matches_bluetooth(state: dict, change: dict) -> bool:

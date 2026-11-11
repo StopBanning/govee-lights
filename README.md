@@ -50,7 +50,9 @@ menu bar, the phone page, Shortcuts, MCP, and Govee's scenes, which go over Blue
 
 - Power, brightness, color and scenes. White temperature is sent as the nearest RGB color.
 - Power and brightness are read back to confirm a change; color can't be.
-- Range is the Mac's Bluetooth range, and each command connects first, so allow 2-3 seconds.
+- Range is the Mac's Bluetooth range. The Bluetooth app stays running and connected between commands, so a change
+  takes a fraction of a second (the very first one, which starts it, takes a few). It lets go of a light after a
+  minute without commands, so the Govee phone app can reach it, and quits after ten quiet minutes.
 - A light takes one Bluetooth connection at a time: while the Govee app on a phone is connected to it, commands
   from the Mac can't get in.
 - Wi-Fi lights advertise over Bluetooth too. Ones already reached over the network are skipped.
@@ -69,7 +71,10 @@ and lights that are off are left alone. The switch survives restarts.
   The first time, macOS asks whether **Lights Hub** may control Spotify: click OK. If you clicked Don't Allow,
   it's in System Settings > Privacy & Security > Automation.
 - Colors: the artwork (from Spotify's image CDN) is shrunk to 24x24 with macOS's `sips`, then the most present
-  vivid colors are picked. Floor lamps get the main color; the other lights take turns with the rest.
+  colors are picked and made vivid (a pastel reads as white on a bulb). Floor lamps get the main color; the other
+  lights take turns with the rest. Lights with parts (the H60B2's three heads, a strip's sections; see `SEGMENTS`
+  in `govee/govee_lan.py`) get several colors across them, and plain lights fade into theirs.
+- A light switched on mid-song joins in within about 15 seconds.
 - `GET /api/spotify` gives the switch, song and colors; `POST /api/spotify` with `{"enabled": true}` switches it.
 
 ## Mac apps

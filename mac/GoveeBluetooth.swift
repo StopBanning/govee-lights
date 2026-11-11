@@ -4,6 +4,7 @@
 //
 //   scan <seconds>                  one JSON line per Govee light heard: {"id", "name", "rssi"}
 //   send <id> <hex>... [--read]     connect, write each packet; with --read, also print each light reply as hex
+//   serve <socket path>             stay running and connected, taking the commands above over a Unix socket
 //
 // Python runs it through `open -W -n <app> --args --out <file> ...`, since `open` can't hand back output or an exit
 // code. So every line goes to that file, ending with "exit <code>" and, on failure, "error <reason>". Codes: 0 done,
@@ -190,9 +191,301 @@ final class Link: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 }
 
+// MARK: - Staying connected
+
+// `serve <socket path>` keeps running and keeps lights connected between commands, so a change takes a fraction of
+// a second instead of the 2-3 a fresh connection costs. Python sends one JSON line per connection on the Unix
+// socket, {"args": ["send", ...]} or {"args": ["scan", "3"]}, and gets back {"lines": [...]}: the same lines a
+// one-shot run writes, ending with "exit <code>". A light is let go after a minute without commands, so the Govee
+// phone app can reach it; the server quits after ten quiet minutes, and Python starts it again when needed.
+final class Connection {
+    let peripheral: CBPeripheral
+    var writer: CBCharacteristic?
+    var notify: CBCharacteristic?
+    var ready = false
+    var waiting: [(String?) -> Void] = []  // run once ready (nil) or failed (the reason)
+    var lastUsed = Date()
+
+    init(_ peripheral: CBPeripheral) {
+        self.peripheral = peripheral
+    }
+}
+
+final class Server: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    let path: String
+    var central: CBCentralManager!
+    var powered = false
+    var connections: [UUID: Connection] = [:]
+    var heard: [UUID: CBPeripheral] = [:]  // seen while scanning, so they can be connected by id
+    var scanning: (until: Date, found: [String], seen: Set<UUID>)?
+    var collecting: [String]?  // light replies during a send with --read
+    var queue: [([String], ([String]) -> Void)] = []
+    var busy = false
+    var lastRequest = Date()
+
+    init(path: String) {
+        self.path = path
+        super.init()
+        central = CBCentralManager(delegate: self, queue: nil)
+        listen()
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.tidy() }
+    }
+
+    // A thread accepts connections; each request is handled on the main queue, one at a time.
+    func listen() {
+        unlink(path)
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8.prefix(MemoryLayout.size(ofValue: address.sun_path) - 1))
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: bytes)
+        }
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard fd >= 0, bound == 0, Darwin.listen(fd, 8) == 0 else {
+            FileHandle.standardError.write(Data("can't listen on \(path)\n".utf8))
+            exit(1)
+        }
+        chmod(path, 0o600)
+        Thread {
+            while true {
+                let client = accept(fd, nil, nil)
+                if client < 0 { continue }
+                Thread { self.serve(client) }.start()
+            }
+        }.start()
+    }
+
+    func serve(_ client: Int32) {
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while !data.contains(10), data.count < 65536 {
+            let count = read(client, &buffer, buffer.count)
+            if count <= 0 { break }
+            data.append(contentsOf: buffer[0..<count])
+        }
+        let request = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let args = request?["args"] as? [String] ?? []
+        let done = DispatchSemaphore(value: 0)
+        var lines: [String] = []
+        DispatchQueue.main.async {
+            self.enqueue(args) { result in
+                lines = result
+                done.signal()
+            }
+        }
+        done.wait()
+        if let reply = try? JSONSerialization.data(withJSONObject: ["lines": lines]) {
+            reply.withUnsafeBytes { _ = write(client, $0.baseAddress, reply.count) }
+            _ = write(client, "\n", 1)
+        }
+        close(client)
+    }
+
+    func enqueue(_ args: [String], _ done: @escaping ([String]) -> Void) {
+        queue.append((args, done))
+        next()
+    }
+
+    func next() {
+        guard !busy, powered || central.state != .unknown, !queue.isEmpty else { return }
+        let (args, done) = queue.removeFirst()
+        busy = true
+        lastRequest = Date()
+        var finished = false
+        let finish: ([String]) -> Void = { lines in
+            if finished { return }
+            finished = true
+            self.busy = false
+            done(lines)
+            self.next()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { finish(["error the light didn't answer in time", "exit 5"]) }
+        guard powered else {
+            finish(["error Bluetooth is off or not allowed for Govee Bluetooth", "exit 3"])
+            return
+        }
+        switch args.first {
+        case "scan":
+            startScan(seconds: Double(args.dropFirst().first ?? "") ?? 3, done: finish)
+        case "send":
+            let read = args.contains("--read")
+            let rest = Array(args.dropFirst()).filter { $0 != "--read" }
+            guard let id = rest.first.flatMap(UUID.init(uuidString:)) else {
+                finish(["error send needs a light id", "exit 2"])
+                return
+            }
+            let decoded = rest.dropFirst().map(bytes)
+            guard !decoded.isEmpty, !decoded.contains(where: { $0 == nil }) else {
+                finish(["error send needs hex packets", "exit 2"])
+                return
+            }
+            send(id, packets: decoded.compactMap { $0 }, read: read, done: finish)
+        default:
+            finish(["error unknown command", "exit 2"])
+        }
+    }
+
+    func startScan(seconds: Double, done: @escaping ([String]) -> Void) {
+        scanning = (Date().addingTimeInterval(seconds), [], [])
+        central.scanForPeripherals(withServices: nil, options: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            self.central.stopScan()
+            let found = self.scanning?.found ?? []
+            self.scanning = nil
+            done(found + ["exit 0"])
+        }
+    }
+
+    func send(_ id: UUID, packets: [Data], read: Bool, done: @escaping ([String]) -> Void) {
+        ready(id) { problem in
+            guard problem == nil, let connection = self.connections[id], let writer = connection.writer else {
+                done(["error " + (problem ?? "the light has no Govee command channel"), problem == "the light wasn't found" ? "exit 4" : "exit 5"])
+                return
+            }
+            connection.lastUsed = Date()
+            if read { self.collecting = [] }
+            let type: CBCharacteristicWriteType = writer.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+            for (index, packet) in packets.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05 * Double(index)) {
+                    connection.peripheral.writeValue(packet, for: writer, type: type)
+                }
+            }
+            let after = 0.05 * Double(packets.count)
+            if !read {
+                DispatchQueue.main.asyncAfter(deadline: .now() + after + 0.05) { done(["exit 0"]) }
+                return
+            }
+            // Wait for the replies: two "aa" answers, or about a second at most.
+            func check(_ tries: Int) {
+                let replies = self.collecting ?? []
+                if replies.filter({ $0.hasPrefix("aa") }).count >= 2 || tries == 0 {
+                    self.collecting = nil
+                    done(replies + ["exit 0"])
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { check(tries - 1) }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + after) { check(24) }
+        }
+    }
+
+    // Connects (or finds the light first) and calls back once it can take commands.
+    func ready(_ id: UUID, _ then: @escaping (String?) -> Void) {
+        if let connection = connections[id], connection.ready, connection.peripheral.state == .connected {
+            then(nil)
+            return
+        }
+        let peripheral = connections[id]?.peripheral ?? heard[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first
+        guard let found = peripheral else {
+            // Not known yet: listen for it briefly.
+            startScan(seconds: 4) { _ in
+                if self.heard[id] != nil { self.ready(id, then) } else { then("the light wasn't found") }
+            }
+            return
+        }
+        let connection = connections[id] ?? Connection(found)
+        connections[id] = connection
+        connection.waiting.append(then)
+        if found.state != .connecting {  // a hung attempt mustn't leave later commands waiting forever
+            found.delegate = self
+            central.connect(found)
+        }
+    }
+
+    func settle(_ peripheral: CBPeripheral, _ problem: String?) {
+        guard let connection = connections[peripheral.identifier] else { return }
+        connection.ready = problem == nil
+        let waiting = connection.waiting
+        connection.waiting = []
+        waiting.forEach { $0(problem) }
+    }
+
+    func tidy() {
+        for connection in connections.values where Date().timeIntervalSince(connection.lastUsed) > 60 {
+            central.cancelPeripheralConnection(connection.peripheral)  // let the Govee app reach it
+            connection.ready = false
+        }
+        if Date().timeIntervalSince(lastRequest) > 600 && !busy {
+            unlink(path)
+            exit(0)
+        }
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        powered = central.state == .poweredOn
+        next()
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String: Any], rssi: NSNumber) {
+        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
+        guard isGovee(name) else { return }
+        heard[peripheral.identifier] = peripheral
+        if var scan = scanning, !scan.seen.contains(peripheral.identifier) {
+            scan.seen.insert(peripheral.identifier)
+            let entry: [String: Any] = ["id": peripheral.identifier.uuidString, "name": name, "rssi": rssi.intValue]
+            if let json = try? JSONSerialization.data(withJSONObject: entry) {
+                scan.found.append(String(decoding: json, as: UTF8.self))
+            }
+            scanning = scan
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        peripheral.discoverServices([service])
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        settle(peripheral, "couldn't connect: \(error?.localizedDescription ?? "no reason given"). Is the Govee app connected to it?")
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        connections[peripheral.identifier]?.ready = false
+        settle(peripheral, "the light disconnected")
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let found = peripheral.services?.first(where: { $0.uuid == service }) else {
+            settle(peripheral, "this light doesn't offer Govee's Bluetooth service")
+            return
+        }
+        peripheral.discoverCharacteristics([writeChar, notifyChar], for: found)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard let connection = connections[peripheral.identifier] else { return }
+        let chars = service.characteristics ?? []
+        connection.writer = chars.first { $0.uuid == writeChar }
+        connection.notify = chars.first { $0.uuid == notifyChar }
+        if let notify = connection.notify {
+            peripheral.setNotifyValue(true, for: notify)  // ready once replies are on
+        } else {
+            settle(peripheral, connection.writer == nil ? "this light has no Govee command channel" : nil)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        settle(peripheral, connections[peripheral.identifier]?.writer == nil ? "this light has no Govee command channel" : nil)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard let value = characteristic.value, collecting != nil else { return }
+        collecting?.append(value.map { String(format: "%02x", $0) }.joined())
+    }
+}
+
 var arguments = Array(CommandLine.arguments.dropFirst())
 if let flag = arguments.firstIndex(of: "--out") {
     arguments.removeSubrange(flag..<min(flag + 2, arguments.count))
 }
-let link = Link(arguments: arguments)
-withExtendedLifetime(link) { RunLoop.main.run() }
+if arguments.first == "serve", arguments.count >= 2 {
+    let server = Server(path: arguments[1])
+    withExtendedLifetime(server) { RunLoop.main.run() }
+} else {
+    let link = Link(arguments: arguments)
+    withExtendedLifetime(link) { RunLoop.main.run() }
+}

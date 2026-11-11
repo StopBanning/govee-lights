@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-build() {  # build <app name> <executable> <swift file> <Info.plist>
+build() {  # build <app name> <executable> <swift file> <Info.plist> [login item label]
   local app="$1.app"
   rm -rf "$app"
   mkdir -p "$app/Contents/MacOS"
@@ -17,15 +17,21 @@ build() {  # build <app name> <executable> <swift file> <Info.plist>
   swiftc -O -swift-version 5 -o "$app/Contents/MacOS/$2" "$3"
   codesign --force --sign - "$app"
   echo "built $PWD/$app"
+  # A copy still running from the old files gets killed by macOS ("code signature invalid") the next time it
+  # loads code from them, so restart it now if it's installed as a login item.
+  local label="${5:-}"
+  if [ -n "$label" ] && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/$label" && echo "restarted $label"
+  fi
 }
 
 case "${1:-all}" in
-  hub) build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist ;;
-  menu) build "Lights" Lights Lights.swift Lights-Info.plist ;;
+  hub) build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist local.govee-lights.hub ;;
+  menu) build "Lights" Lights Lights.swift Lights-Info.plist local.govee-lights.menu ;;
   bluetooth) build "Govee Bluetooth" GoveeBluetooth GoveeBluetooth.swift GoveeBluetooth-Info.plist ;;
   all)
-    build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist
-    build "Lights" Lights Lights.swift Lights-Info.plist
+    build "Lights Hub" LightsHub LightsHub.swift LightsHub-Info.plist local.govee-lights.hub
+    build "Lights" Lights Lights.swift Lights-Info.plist local.govee-lights.menu
     build "Govee Bluetooth" GoveeBluetooth GoveeBluetooth.swift GoveeBluetooth-Info.plist
     ;;
   *) echo "usage: build.sh [hub|menu|bluetooth]" >&2; exit 2 ;;

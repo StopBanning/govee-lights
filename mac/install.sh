@@ -18,7 +18,7 @@ remove() {
   done
 }
 
-agent() {  # agent <label> <executable> <keep alive: true|false>
+agent() {  # agent <label> <executable> <keep alive: true, or a <dict> as text>
   cat > "$AGENTS/$1.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,7 +33,7 @@ agent() {  # agent <label> <executable> <keep alive: true|false>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <$3/>
+  $3
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
@@ -55,7 +55,8 @@ fi
 ./build.sh
 remove
 mkdir -p "$AGENTS"
-agent "$HUB" "$HERE/Lights Hub.app/Contents/MacOS/LightsHub" true
-agent "$MENU" "$HERE/Lights.app/Contents/MacOS/Lights" false
+agent "$HUB" "$HERE/Lights Hub.app/Contents/MacOS/LightsHub" "<true/>"
+# The menu bar app comes back after a crash, but Quit Lights (a clean exit) keeps it closed until the next login.
+agent "$MENU" "$HERE/Lights.app/Contents/MacOS/Lights" "<dict><key>SuccessfulExit</key><false/></dict>"
 echo "Installed. macOS will ask whether Lights Hub may find devices on your local network: click Allow."
 echo "The hub's log is $LOG"
